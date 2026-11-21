@@ -1,0 +1,51 @@
+{
+  "project": "blog",
+  "tasks": [
+    {
+      "id": "outline",
+      "title": "先列提纲",
+      "prompt": "为《为什么局域网里的 AI 比云上的更值》列三级提纲，写成 outline.md",
+      "write": ["outline.md"],
+      "req": {"tags": ["llm"]},
+      "max_attempts": 2,
+      "priority": 10
+    },
+    {
+      "id": "draft",
+      "title": "按提纲写初稿",
+      "prompt": "照着 outline.md 写 1200 字初稿，写到 draft.md",
+      "read": ["outline.md"],
+      "write": ["draft.md"],
+      "deps": ["outline"],
+      "req": {"tags": ["llm"]},
+      "max_attempts": 1
+    },
+    {
+      "id": "facts",
+      "title": "查一下引用的数据",
+      "prompt": "核对初稿里所有数字，把有问题的记到 facts.md",
+      "read": ["draft.md"],
+      "write": ["facts.md"],
+      "deps": ["draft"],
+      "agent": "cli"
+    },
+    {
+      "id": "cover",
+      "title": "顺手做张封面图",
+      "prompt": "给这篇文章生成封面，存 cover.png",
+      "write": ["cover.png"],
+      "req": {"tags": ["gpu"]},
+      "max_attempts": 2
+    },
+    {
+      "id": "publish",
+      "title": "合稿并发布",
+      "prompt": "按 facts.md 修完 draft.md，重命名为 post.md",
+      "read": ["draft.md", "facts.md"],
+      "write": ["post.md"],
+      "deps": ["draft", "facts"],
+      "agent": "cli",
+      "max_attempts": 1
+    }
+  ]
+}

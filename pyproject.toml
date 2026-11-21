@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mesh"
+version = "0.1.0"
+description = "个人 AI 网格操作系统：把文件系统、能力、算力统一到一张网里（零第三方依赖）"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "wangzi5151" }]
+keywords = ["ai", "agent", "lan", "mesh", "grid", "sync", "mcp"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Distributed Computing",
+]
+# 关键：运行时零第三方依赖
+dependencies = []
+
+[project.scripts]
+mesh = "mesh.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/wangzi5151/mesh"
+Source = "https://github.com/wangzi5151/mesh"
+
+[tool.setuptools.packages.find]
+include = ["mesh*"]

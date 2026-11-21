@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: 测试 · Python ${{ matrix.python }}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.8", "3.10", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: 语法编译检查
+        run: python -m compileall -q mesh tests tools
+
+      - name: 零第三方依赖检查
+        run: python tools/check_stdlib_only.py
+
+      - name: 单元测试
+        run: python -m unittest discover -s tests -v
+
+      - name: 命令行冒烟
+        run: |
+          python -m mesh.cli --version
+          python -m mesh.cli doctor --db "$RUNNER_TEMP/mesh.db" --root w="$PWD"
+          python -m mesh.cli hub --db "$RUNNER_TEMP/mesh.db" --once --node n1=http://127.0.0.1:1
