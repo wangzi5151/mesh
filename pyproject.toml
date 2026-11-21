@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mesh"
-version = "0.2.0"
-description = "个人 AI 网格：把文件、能力、算力统一到一张网里（零第三方依赖，支持 TLS 与多租户）"
+version = "0.4.0"
+description = "个人 AI 网格：把文件、能力、算力统一到一张网里，产物自动增量分发到各机器（零第三方依赖）"
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }
 authors = [{ name = "wangzi5151" }]
-keywords = ["ai", "agent", "lan", "mesh", "grid", "sync", "mcp"]
+keywords = ["ai", "agent", "lan", "mesh", "grid", "sync", "rsync", "mcp"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
