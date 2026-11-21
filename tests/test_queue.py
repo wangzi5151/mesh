@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -470,6 +471,118 @@ class TestTokenStore(Base):
     def test_delete_needs_a_key(self):
         with self.assertRaises(Q.QueueError):
             self.q.delete_token()
+
+
+# --------------------------------------------------------------------------
+# 补送表（作业 done 了但产物没送到）
+# --------------------------------------------------------------------------
+class TestDeliveries(Base):
+    def note(self, job_id="t1", to="mesh://b/work", **kw):
+        kw.setdefault("node", "b")
+        kw.setdefault("root", "work")
+        return self.q.record_delivery("%s|%s" % (job_id, to), job_id, "p", to, **kw)
+
+    def test_record_and_list(self):
+        self.note(paths=["a.txt"])
+        rows = self.q.deliveries()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["to"], "mesh://b/work")
+        self.assertEqual(rows[0]["paths"], ["a.txt"])
+        self.assertEqual(rows[0]["state"], Q.DELIVERY_PENDING)
+        self.assertEqual(self.q.delivery_stats(), {Q.DELIVERY_PENDING: 1})
+
+    def test_same_id_updates_instead_of_duplicating(self):
+        self.note(attempts=3, next_at=999, error="连不上")
+        self.note()                              # 重推：清零，立刻可重试
+        rows = self.q.deliveries()
+        self.assertEqual(len(rows), 1, "同一个目标不该堆成两行")
+        self.assertEqual((rows[0]["attempts"], rows[0]["next_at"], rows[0]["error"]),
+                         (0, 0.0, ""))
+
+    def test_due_respects_next_at_and_state(self):
+        self.note(to="mesh://a/work", next_at=100)
+        self.note(to="mesh://b/work", next_at=50)
+        self.note(to="mesh://c/work", next_at=0, state=Q.DELIVERY_DONE)
+        due = self.q.due_deliveries(now=100)
+        self.assertEqual([r["to"] for r in due],
+                         ["mesh://b/work", "mesh://a/work"], "按 next_at 先后")
+        self.assertEqual([r["to"] for r in self.q.due_deliveries(now=60)],
+                         ["mesh://b/work"])
+        self.assertEqual(self.q.due_deliveries(now=10), [], "没到点的一条都不该出现")
+        self.assertEqual(self.q.due_deliveries(now=100, limit=1)[0]["to"],
+                         "mesh://b/work")
+
+    def test_update_partial_fields(self):
+        self.note()
+        key = self.q.deliveries()[0]["id"]
+        self.q.update_delivery(key, state=Q.DELIVERY_FAILED, error="只读")
+        row = self.q.deliveries()[0]
+        self.assertEqual((row["state"], row["error"]), (Q.DELIVERY_FAILED, "只读"))
+        self.assertEqual(row["attempts"], 0, "没给的字段不能被覆盖成 None")
+
+    def test_update_unknown_row(self):
+        self.assertFalse(self.q.update_delivery("nope", state=Q.DELIVERY_DONE))
+
+    def test_forget_by_job(self):
+        self.note("t1")
+        self.note("t2")
+        self.assertEqual(self.q.forget_deliveries("t1"), 1)
+        self.assertEqual([r["job_id"] for r in self.q.deliveries()], ["t2"])
+
+    def test_filter_by_job_and_state(self):
+        self.note("t1")
+        self.note("t2", to="mesh://c/work", state=Q.DELIVERY_FAILED)
+        self.assertEqual(len(self.q.deliveries(job_id="t1")), 1)
+        self.assertEqual([r["job_id"] for r in self.q.deliveries(
+            state=Q.DELIVERY_FAILED)], ["t2"])
+
+    def test_survives_restart(self):
+        path = os.path.join(self.tmp, "restart.db")
+        q = Q.Queue(path)
+        q.record_delivery("t1|mesh://b/work", "t1", "p", "mesh://b/work", "b", "work",
+                          ["a.txt"], next_at=5)
+        q.close()
+        q = Q.Queue(path)
+        try:
+            rows = q.deliveries()
+            self.assertEqual([r["to"] for r in rows], ["mesh://b/work"])
+            self.assertEqual(rows[0]["paths"], ["a.txt"])
+        finally:
+            q.close()
+
+    def test_table_appears_in_an_old_database(self):
+        """0.2 的库里没有 deliveries 表，打开时自动建（executescript 每次都跑）。"""
+        path = os.path.join(self.tmp, "old.db")
+        old = sqlite3.connect(path)
+        old.executescript("""
+            CREATE TABLE jobs (
+                id TEXT PRIMARY KEY, project TEXT NOT NULL,
+                title TEXT NOT NULL DEFAULT '', prompt TEXT NOT NULL DEFAULT '',
+                read_json TEXT NOT NULL DEFAULT '[]',
+                write_json TEXT NOT NULL DEFAULT '[]',
+                priority INTEGER NOT NULL DEFAULT 0,
+                req_json TEXT NOT NULL DEFAULT '{}',
+                agent TEXT NOT NULL DEFAULT '', cmd TEXT NOT NULL DEFAULT '',
+                model TEXT NOT NULL DEFAULT '', verify TEXT NOT NULL DEFAULT '',
+                state TEXT NOT NULL DEFAULT 'queued',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL DEFAULT 2,
+                lease_owner TEXT NOT NULL DEFAULT '',
+                lease_expires REAL NOT NULL DEFAULT 0,
+                feedback TEXT NOT NULL DEFAULT '',
+                result_json TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL, updated_at REAL NOT NULL,
+                started_at REAL NOT NULL DEFAULT 0,
+                finished_at REAL NOT NULL DEFAULT 0
+            );
+        """)
+        old.commit()
+        old.close()
+        q = Q.Queue(path)
+        self.addCleanup(q.close)
+        self.assertEqual(q.delivery_stats(), {})
+        q.record_delivery("t1|mesh://b/work", "t1", "p", "mesh://b/work", "b", "work")
+        self.assertEqual(q.delivery_stats(), {Q.DELIVERY_PENDING: 1})
 
 
 if __name__ == "__main__":

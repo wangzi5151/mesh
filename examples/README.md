@@ -58,9 +58,11 @@ mesh status --hub http://127.0.0.1:8788 --hub-token 管理口令
 
 `plan.json` 里 `publish` 带了一句 `"sync": ["mesh://笔记本/work"]`：这条作业改过的文件
 除了收进 `产物/`，还会推给 `笔记本` 这个节点的 `work` root —— 那边有旧版本就走差分。
-推送失败不影响作业状态（改动已经在源机器上落地了），修好之后补一刀：
+推送失败不影响作业状态（改动已经在源机器上落地了）：控制面会自己按退避补送
+（30s→10min，最多 10 次），`mesh deliveries` 能看到还欠谁。试够了还不行，补一刀：
 
 ```sh
+mesh deliveries --db mesh.db            # 谁没送到、试了几次
 mesh sync publish --db mesh.db --mirror ./产物
 ```
 

@@ -48,6 +48,14 @@ MIRROR_CHUNK = 1 << 20
 MAX_SIG_BLOCKS_PULL = 96     # 拉产物时签名表最多这么多块（每块 ≈88 字节）
 MAX_PUSH_BYTES = 32 << 20    # 单个文件分发上限：JSON 里装 base64，再大就该用 exec 搬
 
+# 补送（作业已 done，但产物没送到目标）。和作业重试分开，是因为重跑作业会把
+# 同一份改动做两遍 —— 那正是租约机制在防的事。
+SYNC_RETRY_BASE = 30.0       # 第一次补送等 30 秒
+SYNC_RETRY_MAX = 600.0       # 之后最多 10 分钟一次
+SYNC_MAX_ATTEMPTS = 10       # 十次都送不到就置为 failed，等 mesh sync 人工介入
+SYNC_BATCH = 8               # 一轮最多补几个目标
+SYNC_BUDGET = 60.0           # 一轮补送最多花这么久（别让一个卡住的目标拖住调度）
+
 # 每个 RPC 方法需要什么权限。没列出来的方法一律按 admin 处理 —— 加了新方法
 # 忘了写在这里，是"默认更严"，不是"默认放行"。
 RPC_ACTION = {
@@ -120,6 +128,41 @@ def _safe_name(name):
     """
     cleaned = re.sub(r"[^\w.-]", "_", str(name or ""), flags=re.UNICODE)
     return cleaned.strip("._")[:64] or "unnamed"
+
+
+def _retryable(exc):
+    """这个错误值不值得再试一次。
+
+    判据直接用传输层的 ``WireError.kind``：网络不通、响应不成形、5xx 是"等会儿再说"；
+    节点明确拒绝（只读 root、路径越界、要删的是目录）和 4xx（令牌不对、路径不认）
+    再试一百次也是同一个结果，直接进 failed 让人看。
+    """
+    if isinstance(exc, wire.WireError):
+        if exc.kind in ("network", "protocol"):
+            return True
+        if exc.kind == "http":
+            status = int(exc.status or 0)
+            return status >= 500 or status == 429
+        return False                      # remote：节点自己拒绝了
+    if isinstance(exc, delta.DeltaError):
+        return True                       # 签名/基线对不上多半是两端抢着改，重来一次就好
+    if isinstance(exc, OSError):
+        return True                       # 本地读镜像失败
+    return False                          # HubError：文件太大、源文件没了，重试没意义
+
+
+def _delivery_id(job_id, to_addr):
+    """一条"作业 → 目标"的补送行。同一个目标反复重推只会更新这一行。"""
+    return "%s|%s" % (job_id, to_addr)
+
+
+def _backoff(attempts):
+    """失败 ``attempts`` 次之后等多久再试：30s、60s、120s…，封顶 10 分钟。
+
+    指数退避而不是固定间隔：手机放在兜里睡着，第一次可能 30 秒就醒了，
+    也可能整晚不醒 —— 前者要快，后者要省（不要每 30 秒扇一次网卡）。
+    """
+    return min(SYNC_RETRY_MAX, SYNC_RETRY_BASE * (2 ** (max(1, attempts) - 1)))
 
 
 class HubError(Exception):
@@ -418,6 +461,13 @@ class Hub(object):
                 state = self.queue.fail(leased.id, error=error[:2000], retryable=True)
                 report["failed"].append({"job": leased.id, "state": state,
                                          "error": error[:200]})
+
+        # 最后补送：前面派发失败的、上一次没收到的，到点的都再试一遍。
+        # 放在派发之后 —— 先把新作业发出去，别让一个暂时联系不上的目标
+        # 挡住这一轮的调度。
+        retried = self.retry_deliveries(now=now)
+        if retried:
+            report["retried"] = retried
         return report
 
     # ------------------------------------------------------------------
@@ -587,6 +637,7 @@ class Hub(object):
         for target in targets:
             entry = self._push_to(src_node, src_root, target, changed, deleted)
             report["targets"].append(entry)
+            self._note_delivery(job, entry)
             report["files"] += len(entry["files"])
             report["sent"] += entry["sent"]
             report["size"] += entry["size"]
@@ -597,13 +648,23 @@ class Hub(object):
         report["ratio"] = (round(1.0 - report["sent"] / float(report["size"]), 4)
                            if report["size"] else 0.0)
         report["ok"] = not report["errors"]
+        # 和补送表保持同一个形状：`mesh jobs --show` 一眼能看出"送到没有、还欠谁"
+        report["pending"] = [t["to"] for t in report["targets"]
+                             if not t["ok"] and t.get("retryable")]
+        report["failed"] = [t["to"] for t in report["targets"]
+                            if not t["ok"] and not t.get("retryable")]
+        report["delivered"] = [t["to"] for t in report["targets"] if t["ok"]]
         return report
 
     def _push_to(self, src_node, src_root, target, changed, deleted):
-        """推给一个目标 root。返回这个目标的明细（失败也只记在自己头上）。"""
+        """推给一个目标 root。返回这个目标的明细（失败也只记在自己头上）。
+
+        ``retryable`` 是这个目标值不值得再试一次：网络问题值得，
+        只读 root / 根不存在 / 文件太大不值得。补送表按它决定下一步。
+        """
         entry = {"to": str(target), "node": target.node, "root": target.root,
                  "paths": list(target.paths), "files": [], "sent": 0, "size": 0,
-                 "errors": [], "ok": True, "skipped": ""}
+                 "errors": [], "ok": True, "skipped": "", "retryable": True}
 
         if target.node == src_node and target.root == src_root:
             # 自己推给自己没有意义，但也别报错 —— 计划里写全量的时候很常见
@@ -613,8 +674,10 @@ class Hub(object):
         try:
             client = self.client_for(target.node)
         except HubError as exc:
+            # 节点没登记：补送再多次也不会变成"已登记"，得先 mesh nodes add
             entry["errors"].append(str(exc))
             entry["ok"] = False
+            entry["retryable"] = False
             return entry
 
         for raw in changed:
@@ -622,6 +685,7 @@ class Hub(object):
                 rel = _rel_safe(raw)
             except HubError as exc:
                 entry["errors"].append(str(exc))
+                entry["retryable"] = False
                 continue
             if not target.accepts(rel):
                 continue
@@ -630,6 +694,8 @@ class Hub(object):
                 item = self._push_file(source, target, client)
             except (wire.WireError, delta.DeltaError, OSError, HubError) as exc:
                 entry["errors"].append("%s：%s" % (rel, exc))
+                if not _retryable(exc):
+                    entry["retryable"] = False
                 continue
             entry["files"].append(item)
             entry["sent"] += item["sent"]
@@ -643,12 +709,16 @@ class Hub(object):
                 res = client.rm("mesh://%s/%s/%s" % (target.node, target.root, rel))
             except (wire.WireError, OSError, HubError) as exc:
                 entry["errors"].append("%s：%s" % (raw, exc))
+                if not _retryable(exc):
+                    entry["retryable"] = False
                 continue
             entry["files"].append({"path": rel, "mode":
                                    "delete" if (res or {}).get("removed") else "absent",
                                    "sent": 0, "size": 0})
 
         entry["ok"] = not entry["errors"]
+        if entry["ok"]:
+            entry["retryable"] = False        # 成了就不用再试了
         return entry
 
     def _push_file(self, source, target, client):
@@ -721,6 +791,124 @@ class Hub(object):
         result["sync"] = report
         self.queue.update_result(job_id, result)
         return report
+
+    # ------------------------------------------------------------------
+    # 补送：作业 done 了，但产物没送到
+    # ------------------------------------------------------------------
+    def _note_delivery(self, job, entry):
+        """把一次推送的结果记进补送表（"自己推自己"那种跳过的不记）。"""
+        if entry.get("skipped"):
+            return
+        state, attempts, next_at = queue_mod.DELIVERY_DONE, 1, 0.0
+        if not entry["ok"]:
+            if entry.get("retryable"):
+                # 立刻排一次 "base 秒后" 的重试；之后按 attempts 指数退避
+                state, next_at = queue_mod.DELIVERY_PENDING, time.time() + SYNC_RETRY_BASE
+            else:
+                state = queue_mod.DELIVERY_FAILED
+        self.queue.record_delivery(
+            _delivery_id(job.id, entry["to"]), job.id, job.project, entry["to"],
+            entry["node"], entry["root"], entry["paths"], state,
+            error="；".join(entry["errors"][:3]), attempts=attempts, next_at=next_at)
+
+    def retry_deliveries(self, now=None):
+        """补送到点的目标。返回这一轮试了哪些、结果如何。
+
+        只在持有调度权的那一轮跑（``tick`` 开头已经拦过），所以不会有两个控制面
+        同时往同一个目标上推。也**绝不**把作业拉回队列重跑 —— 那样同一份改动
+        会被做两遍，而这正是整条租约机制在防的事。
+        """
+        now = now or time.time()
+        budget_end = time.time() + SYNC_BUDGET
+        done = []
+        for row in self.queue.due_deliveries(now=now, limit=SYNC_BATCH):
+            if time.time() > budget_end:
+                break                     # 目标卡住时别把整轮调度拖死
+            item = self._retry_one(row, now)
+            if item:
+                done.append(item)
+        return done
+
+    def _retry_one(self, row, now):
+        job = self.queue.get(row["job_id"])
+        result = dict(job.result or {}) if job else {}
+        src_node, src_root = result.get("node") or "", result.get("root") or ""
+
+        def give_up(reason):
+            self.queue.update_delivery(row["id"], state=queue_mod.DELIVERY_FAILED,
+                                       error=reason, attempts=row["attempts"] + 1,
+                                       next_at=0.0)
+            self._refresh_sync_result(row["job_id"])
+            return {"job": row["job_id"], "to": row["to"], "state": "failed",
+                    "error": reason}
+
+        if job is None:
+            return give_up("作业已经不在了")
+        if not src_node or not src_root:
+            return give_up("作业结果里没记下源节点/root")
+
+        target = task.SyncTarget.from_any({"to": row["to"], "paths": row["paths"]})
+        entry = self._push_to(src_node, src_root, target,
+                              sorted(result.get("changed") or []),
+                              sorted(result.get("deleted") or []))
+        attempts = row["attempts"] + 1
+        if entry["ok"]:
+            self.queue.update_delivery(row["id"], state=queue_mod.DELIVERY_DONE,
+                                       error="", attempts=attempts, next_at=0.0)
+            self._refresh_sync_result(row["job_id"])
+            return {"job": row["job_id"], "to": row["to"], "state": "done",
+                    "attempts": attempts, "sent": entry["sent"]}
+        if not entry["retryable"]:
+            return give_up("；".join(entry["errors"][:3]))
+        if attempts >= SYNC_MAX_ATTEMPTS:
+            return give_up("补送 %d 次都没送到：%s"
+                           % (attempts, "；".join(entry["errors"][:3])))
+
+        delay = _backoff(attempts)
+        self.queue.update_delivery(
+            row["id"], state=queue_mod.DELIVERY_PENDING,
+            error="；".join(entry["errors"][:3]), attempts=attempts,
+            next_at=now + delay)
+        self._refresh_sync_result(row["job_id"])
+        return {"job": row["job_id"], "to": row["to"], "state": "pending",
+                "attempts": attempts, "retry_in": delay}
+
+    def _refresh_sync_result(self, job_id):
+        """把补送表的现状写回作业结果的 ``sync``。
+
+        作业结果里的 ``sync`` 是"第一次推送发生了什么"，补送会改变结论 ——
+        `mesh jobs --show` 看到的那一份必须能回答"到底送到没有"，
+        所以这里把 pending/failed/delivered 三份名单明确写进去。
+        """
+        rows = self.queue.deliveries(job_id=job_id)
+        if not rows:
+            return False
+        job = self.queue.get(job_id)
+        if job is None or not isinstance(job.result, dict):
+            return False
+        result = dict(job.result)
+        sync = dict(result.get("sync") or {})
+        sync["pending"] = [r["to"] for r in rows if r["state"] == queue_mod.DELIVERY_PENDING]
+        sync["failed"] = [r["to"] for r in rows if r["state"] == queue_mod.DELIVERY_FAILED]
+        sync["delivered"] = [r["to"] for r in rows if r["state"] == queue_mod.DELIVERY_DONE]
+        if sync["pending"] or sync["failed"]:
+            sync["ok"] = False
+            detail = []
+            for r in rows:
+                if r["state"] != queue_mod.DELIVERY_DONE and r["error"]:
+                    detail.append("%s：%s" % (r["to"], r["error"]))
+            if detail:
+                sync["errors"] = detail
+        else:
+            # 补送到了：结论要改口，但**第一次为什么没送到**得留着 ——
+            # 不然出了事只剩一句"成功了"，排查的人没有线索。
+            if sync.get("errors"):
+                sync["first_error"] = sync["errors"][0]
+            sync["ok"] = True
+            sync["errors"] = []
+        result["sync"] = sync
+        self.queue.update_result(job_id, result)
+        return True
 
 
     def _pick_node(self, req, now, busy):
@@ -799,6 +987,7 @@ class Hub(object):
             "projects": sorted({j.project for j in self.queue.list()}),
             "leader": self._leader,
             "mirror": self.mirror or "",
+            "deliveries": self.queue.delivery_stats(),
             "auth": {"enabled": self.auth.enabled,
                      "grants": len(self.auth.grants),
                      "admin_tokens": len(self.auth.admin_hashes)},
@@ -841,6 +1030,20 @@ class Hub(object):
         srv.add_get("/", self.dashboard)
         return srv
 
+    @staticmethod
+    def _delivery_note(stats):
+        """面板上那一小段"未送达"提示，没有就不占地方。"""
+        pending = int(stats.get(queue_mod.DELIVERY_PENDING, 0))
+        failed = int(stats.get(queue_mod.DELIVERY_FAILED, 0))
+        if not pending and not failed:
+            return ""
+        bits = []
+        if pending:
+            bits.append("待补送 %d" % pending)
+        if failed:
+            bits.append("补送失败 %d" % failed)
+        return " · 分发 " + "，".join(bits)
+
     def dashboard(self, query=None):
         """自包含状态页：没有外部资源，手机浏览器打开就能看。"""
         query = query or {}
@@ -864,8 +1067,9 @@ class Hub(object):
             ".on{color:#7ec699}.off{color:#e06c75}.muted{color:#8b93a1}",
             "</style></head><body>",
             "<h1>mesh <span class=\"muted\">%s</span></h1>" % html.escape(str(self.queue.path)),
-            "<div class=\"muted\">每 %d 秒刷新 · 作业 %s</div>" % (
-                refresh, html.escape(json.dumps(st["jobs"], ensure_ascii=False, sort_keys=True))),
+            "<div class=\"muted\">每 %d 秒刷新 · 作业 %s%s</div>" % (
+                refresh, html.escape(json.dumps(st["jobs"], ensure_ascii=False, sort_keys=True)),
+                self._delivery_note(st.get("deliveries") or {})),
             "<h2>节点</h2>",
         ]
         if st["nodes"]:
@@ -904,7 +1108,6 @@ class Hub(object):
     def close(self):
         self.release_leadership()
         self.queue.close()
-
     def __enter__(self):
         return self
 

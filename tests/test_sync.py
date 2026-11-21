@@ -11,6 +11,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -732,6 +733,243 @@ class TestCliSync(SyncBase):
         code, out = self.run_cli(["sync", "nope", "--db", self.db])
         self.assertEqual(code, 1)
         self.assertIn("nope", out)
+
+
+# --------------------------------------------------------------------------
+# 补送：作业 done 了，但产物没送到
+# --------------------------------------------------------------------------
+class TestDeliveryRetry(SyncBase):
+    """目标离线不该让人手工盯着 —— 控制面自己退避重试，但**不重跑作业**。"""
+
+    def offline_pair(self):
+        """目标一开始就连不上，作业照常跑完。"""
+        h = self.setup_pair(mirror=True)
+        h.add_node("笔记本", "http://127.0.0.1:1")
+        self.submit(h, [self.task(sync=["mesh://笔记本/work"])])
+        return h
+
+    def test_failed_push_leaves_a_pending_delivery(self):
+        h = self.offline_pair()
+        rows = h.queue.deliveries()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["state"], Q.DELIVERY_PENDING)
+        self.assertEqual(rows[0]["to"], "mesh://笔记本/work")
+        self.assertEqual(rows[0]["attempts"], 1)
+        self.assertEqual(h.queue.get("t1").state, Q.DONE, "作业本身是成功的")
+        self.assertEqual(self.job(h).result["sync"]["pending"], ["mesh://笔记本/work"])
+
+    def test_not_retried_before_backoff(self):
+        h = self.offline_pair()
+        self.assertEqual(h.retry_deliveries(now=time.time()), [],
+                         "刚失败就重试等于原地打转")
+
+    def test_retry_delivers_when_the_target_comes_back(self):
+        h = self.offline_pair()
+        h.add_node("笔记本", self.dst_srv.url)          # 目标回来了
+        later = time.time() + H.SYNC_RETRY_BASE + 1
+        out = h.retry_deliveries(now=later)
+
+        self.assertEqual([r["state"] for r in out], ["done"])
+        self.assertEqual(self.read(self.dst()), self.read(os.path.join(self.src_dir, "doc.txt")))
+        row = h.queue.deliveries()[0]
+        self.assertEqual((row["state"], row["attempts"]), (Q.DELIVERY_DONE, 2))
+
+    def test_result_is_rewritten_after_a_successful_retry(self):
+        h = self.offline_pair()
+        h.add_node("笔记本", self.dst_srv.url)
+        h.retry_deliveries(now=time.time() + H.SYNC_RETRY_BASE + 1)
+        sync = self.job(h).result["sync"]
+        self.assertTrue(sync["ok"], "送到了就要改口，不能还挂着失败")
+        self.assertEqual(sync["errors"], [])
+        self.assertEqual(sync["delivered"], ["mesh://笔记本/work"])
+        self.assertEqual(sync["pending"], [])
+        self.assertIn("连不上", sync["first_error"],
+                      "第一次为什么没送到要留着，别只剩一句'成功了'")
+        self.assertEqual(self.job(h).state, Q.DONE)
+
+    def test_retry_never_reruns_the_job(self):
+        calls = []
+
+        def runner(job):
+            calls.append(job.id)
+            with open(os.path.join(self.src_dir, "doc.txt"), "w") as f:
+                f.write(BODY)
+            return {"stdout": "ok"}
+
+        node = A.Node("手机", roots=[{"name": "work", "path": self.src_dir}],
+                      tags=["源"], runner=runner)
+        h = self.hub()
+        h.add_node("手机", self.serve(node).url)
+        _, dst_srv = self.sink()
+        h.add_node("笔记本", "http://127.0.0.1:1")
+        self.submit(h, [self.task(sync=["mesh://笔记本/work"])])
+        h.add_node("笔记本", dst_srv.url)
+        for i in range(3):
+            h.retry_deliveries(now=time.time() + 3600 * (i + 1))
+        self.assertEqual(calls, ["t1"], "补送产物，不是重做作业")
+
+    def test_backoff_grows_and_caps(self):
+        self.assertEqual(H._backoff(1), H.SYNC_RETRY_BASE)
+        self.assertEqual(H._backoff(2), H.SYNC_RETRY_BASE * 2)
+        self.assertEqual(H._backoff(3), H.SYNC_RETRY_BASE * 4)
+        self.assertEqual(H._backoff(50), H.SYNC_RETRY_MAX)
+
+    def test_backoff_is_actually_applied(self):
+        h = self.offline_pair()
+        then = time.time() + H.SYNC_RETRY_BASE + 1
+        h.retry_deliveries(now=then)                    # 第二次也失败
+        row = h.queue.deliveries()[0]
+        self.assertEqual(row["state"], Q.DELIVERY_PENDING)
+        self.assertEqual(row["attempts"], 2)
+        self.assertGreaterEqual(row["next_at"] - then, H._backoff(2) - 1)
+
+    def test_gives_up_after_max_attempts(self):
+        h = self.offline_pair()
+        row = h.queue.deliveries()[0]
+        h.queue.update_delivery(row["id"], attempts=H.SYNC_MAX_ATTEMPTS - 1)
+        h.retry_deliveries(now=time.time() + H.SYNC_RETRY_MAX + 1)
+        row = h.queue.deliveries()[0]
+        self.assertEqual(row["state"], Q.DELIVERY_FAILED)
+        self.assertIn("补送", row["error"])
+        self.assertEqual(h.retry_deliveries(now=time.time() + 10 ** 6), [],
+                         "failed 的不再自动重试")
+
+    def test_permanent_error_is_not_retried(self):
+        """只读 root 这种事再试一百次也一样，立刻置 failed 让人看见。"""
+        h = self.setup_pair(dst_mode="ro")
+        self.submit(h, [self.task(sync=["mesh://笔记本/work"])])
+        row = h.queue.deliveries()[0]
+        self.assertEqual(row["state"], Q.DELIVERY_FAILED)
+        self.assertIn("只读", row["error"])
+        self.assertEqual(h.retry_deliveries(now=time.time() + 10 ** 6), [])
+
+    def test_unregistered_target_is_terminal(self):
+        h = self.setup_pair()
+        self.submit(h, [self.task(sync=["mesh://还没装的机器/work"])])
+        row = h.queue.deliveries()[0]
+        self.assertEqual(row["state"], Q.DELIVERY_FAILED)
+        self.assertIn("未注册", row["error"])
+
+    def test_one_offline_target_does_not_block_the_other(self):
+        other = os.path.join(self.tmp, "树莓派")
+        os.makedirs(other)
+        h = self.setup_pair()
+        _, srv = self.sink("树莓派", path=other)
+        h.add_node("树莓派", srv.url)
+        h.add_node("离线机", "http://127.0.0.1:1")
+        self.submit(h, [self.task(sync=["mesh://树莓派/work", "mesh://离线机/work"])])
+
+        states = {r["to"]: r["state"] for r in h.queue.deliveries()}
+        self.assertEqual(states["mesh://树莓派/work"], Q.DELIVERY_DONE)
+        self.assertEqual(states["mesh://离线机/work"], Q.DELIVERY_PENDING)
+        self.assertTrue(os.path.exists(os.path.join(other, "doc.txt")))
+
+    def test_deliveries_survive_a_hub_restart(self):
+        """补送表在库里：控制面重启之后接着补，不用人再推一次。"""
+        h = self.offline_pair()
+        h.close()
+        self._hubs.remove(h)
+
+        h2 = self.hub()                                # 新进程
+        h2.add_node("笔记本", self.dst_srv.url)
+        out = h2.retry_deliveries(now=time.time() + H.SYNC_RETRY_BASE + 1)
+        self.assertEqual([r["state"] for r in out], ["done"])
+        self.assertTrue(os.path.exists(self.dst()))
+
+    def test_tick_runs_the_retry(self):
+        h = self.offline_pair()
+        h.add_node("笔记本", self.dst_srv.url)
+        row = h.queue.deliveries()[0]
+        h.queue.update_delivery(row["id"], next_at=0)  # 让它这一轮就到点
+        report = h.tick()
+        self.assertEqual([r["state"] for r in report.get("retried") or []], ["done"])
+        self.assertTrue(os.path.exists(self.dst()))
+
+    def test_standby_hub_does_not_retry(self):
+        """两个控制面只有一个在派发，补送也一样 —— 否则同一个文件推两遍。"""
+        h = self.offline_pair()
+        h.add_node("笔记本", self.dst_srv.url)
+        row = h.queue.deliveries()[0]
+        h.queue.update_delivery(row["id"], next_at=0)
+
+        h.ensure_leadership()                          # 这一台拿着调度权
+        standby = self.hub()
+        standby.add_node("笔记本", self.dst_srv.url)
+        report = standby.tick()
+        self.assertIsNotNone(report.get("standby"))
+        self.assertNotIn("retried", report)
+        self.assertEqual(h.queue.deliveries()[0]["state"], Q.DELIVERY_PENDING)
+
+    def test_manual_sync_clears_a_failed_delivery(self):
+        h = self.setup_pair(dst_mode="ro")
+        self.submit(h, [self.task(sync=["mesh://笔记本/work"])])
+        self.assertEqual(h.queue.deliveries()[0]["state"], Q.DELIVERY_FAILED)
+
+        # 把目标改成可写（换一个 root），手工重推
+        os.makedirs(os.path.join(self.tmp, "可写"))
+        node = A.Node("笔记本", roots=[{"name": "work", "path": self.dst_dir}],
+                      runner=lambda job: {"stdout": "-"})
+        srv = self.serve(node)
+        h.add_node("笔记本", srv.url)
+        report = h.sync_job("t1")
+        self.assertTrue(report["ok"], report["errors"])
+        self.assertEqual(h.queue.deliveries()[0]["state"], Q.DELIVERY_DONE)
+
+
+class TestDeliveriesCli(SyncBase):
+    def run_cli(self, argv):
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = CLI.main(argv)
+        return code, buf.getvalue()
+
+    def test_lists_pending(self):
+        h = self.setup_pair()
+        h.add_node("笔记本", "http://127.0.0.1:1")
+        self.submit(h, [self.task(sync=["mesh://笔记本/work"])])
+        h.close()
+        self._hubs.remove(h)
+
+        code, out = self.run_cli(["deliveries", "--db", self.db])
+        self.assertEqual(code, 0, out)
+        self.assertIn("待补送", out)
+        self.assertIn("mesh://笔记本/work", out)
+
+    def test_json_and_state_filter(self):
+        h = self.setup_pair()
+        h.add_node("笔记本", "http://127.0.0.1:1")
+        self.submit(h, [self.task(sync=["mesh://笔记本/work"])])
+        h.close()
+        self._hubs.remove(h)
+
+        code, out = self.run_cli(["deliveries", "--db", self.db,
+                                  "--state", "pending", "--json"])
+        self.assertEqual(code, 0, out)
+        self.assertIn('"state": "pending"', out)
+        code, out = self.run_cli(["deliveries", "--db", self.db, "--state", "done"])
+        self.assertEqual(code, 0, out)
+        self.assertIn("没有符合条件", out)
+
+    def test_empty_queue(self):
+        h = self.setup_pair()
+        self.submit(h, [self.task()])              # 没有 sync，自然没有补送
+        h.close()
+        self._hubs.remove(h)
+        code, out = self.run_cli(["deliveries", "--db", self.db])
+        self.assertEqual(code, 0, out)
+        self.assertIn("没有要补送", out)
+
+    def test_status_mentions_outstanding_deliveries(self):
+        h = self.setup_pair()
+        h.add_node("笔记本", "http://127.0.0.1:1")
+        self.submit(h, [self.task(sync=["mesh://笔记本/work"])])
+        h.close()
+        self._hubs.remove(h)
+        code, out = self.run_cli(["status", "--db", self.db])
+        self.assertEqual(code, 0, out)
+        self.assertIn("待补送 1", out)
 
 
 if __name__ == "__main__":

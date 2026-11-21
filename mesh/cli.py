@@ -381,6 +381,14 @@ def _summary_line(report, prev=None):
     sync_errors = report.get("sync_errors") or []
     if sync_errors:
         parts.append("分发失败 %d" % len(sync_errors))
+    retried = report.get("retried") or []
+    if retried:
+        ok = [r for r in retried if r.get("state") == "done"]
+        if ok:
+            parts.append("补送到 %d" % len(ok))
+        give_up = [r for r in retried if r.get("state") == "failed"]
+        if give_up:
+            parts.append("补送放弃 %d" % len(give_up))
     if not parts:
         return "", state
     return "[%s] %s" % (time.strftime("%H:%M:%S"), "，".join(parts)), state
@@ -454,6 +462,18 @@ def cmd_status(args):
     _out("队列 %s" % args.db)
     _out("  作业  %s" % ("，".join(parts) if parts else "空"))
     _out("  项目  %s" % ("，".join(projects) if projects else "-"))
+    queue = open_queue(args)
+    try:
+        deliv = queue.delivery_stats()
+    finally:
+        queue.close()
+    if deliv.get(queue_mod.DELIVERY_PENDING) or deliv.get(queue_mod.DELIVERY_FAILED):
+        bits = []
+        if deliv.get(queue_mod.DELIVERY_PENDING):
+            bits.append("待补送 %d" % deliv[queue_mod.DELIVERY_PENDING])
+        if deliv.get(queue_mod.DELIVERY_FAILED):
+            bits.append("失败 %d" % deliv[queue_mod.DELIVERY_FAILED])
+        _out("  分发  %s（mesh deliveries 看详情）" % "，".join(bits))
     if jobs:
         _out("")
         _out(_jobs_table(jobs))
@@ -633,6 +653,46 @@ def _saved_text(target):
         return "-"
     saved = max(0, target["size"] - target["sent"])
     return "%.0f%%" % (100.0 * saved / float(target["size"]))
+
+
+def cmd_deliveries(args):
+    """补送队列：作业都 done 了，但产物还有没送到的。"""
+    queue = open_queue(args)
+    try:
+        rows = queue.deliveries(job_id=args.job, state=args.state, limit=args.limit)
+        stats = queue.delivery_stats()
+    finally:
+        queue.close()
+
+    if args.json:
+        _out(json.dumps(rows, ensure_ascii=False, indent=2))
+        return EXIT_OK
+
+    if not rows:
+        _out("没有要补送的产物" if not stats else "没有符合条件的记录")
+        return EXIT_OK
+
+    labels = {queue_mod.DELIVERY_PENDING: "待补送",
+              queue_mod.DELIVERY_DONE: "已送到",
+              queue_mod.DELIVERY_FAILED: "失败"}
+    table_rows = []
+    for r in rows:
+        when = "-"
+        if r["state"] == queue_mod.DELIVERY_PENDING and r["next_at"]:
+            left = int(r["next_at"] - time.time())
+            when = "马上" if left <= 0 else "%d 秒后" % left
+        table_rows.append([
+            r["job_id"], r["to"], r["state"] and labels.get(r["state"], r["state"]),
+            r["attempts"], when, (r["error"] or "-")[:40],
+        ])
+    _out(table(table_rows, ["作业", "目标", "状态", "尝试", "下次", "上次错误"]))
+    bits = ["%s %d" % (labels.get(k, k), v) for k, v in sorted(stats.items())]
+    if bits:
+        _out("")
+        _out("合计  %s" % "，".join(bits))
+        if stats.get(queue_mod.DELIVERY_PENDING) or stats.get(queue_mod.DELIVERY_FAILED):
+            _out("控制面在跑的话，会用退避自动重试；想立刻重来一遍：mesh sync <作业>")
+    return EXIT_OK
 
 
 # --------------------------------------------------------------------------
@@ -895,6 +955,16 @@ def build_parser():
     p.add_argument("--tls-insecure", action="store_true", help="连节点时不校验证书")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_sync)
+
+    # -- deliveries
+    p = sub.add_parser("deliveries", help="看产物补送：哪些还没送到")
+    p.add_argument("--db", default="mesh.db")
+    p.add_argument("--state", default=None, choices=list(queue_mod.DELIVERY_STATES),
+                   help="只看某个状态（pending 待补送 / failed 试够了 / done 已送到）")
+    p.add_argument("--job", default=None, metavar="JOB_ID", help="只看某条作业")
+    p.add_argument("--limit", type=int, default=50)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_deliveries)
 
     # -- nodes
     p = sub.add_parser("nodes", help="管理节点清单（存在库里，重启不丢）")

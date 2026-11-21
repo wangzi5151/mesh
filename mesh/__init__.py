@@ -14,7 +14,7 @@
 ``address``   统一寻址：解析、规范化、通配匹配
 ``delta``     块级增量传输：Adler-32 滚动校验 + sha256，rsync 式差分
 ``capability``能力注册表：本机探测、调度打分、节点清单
-``queue``     持久作业队列：SQLite WAL + 租约 + 崩溃恢复
+``queue``     持久作业队列：SQLite WAL + 租约 + 崩溃恢复 + 补送表
 ``task``      任务图：DAG 校验、批次、写作用域
 ``wire``      零依赖 HTTP + JSON-RPC（客户端与服务端）
 ``agent``     节点 agent：路径围栏、只读 root、作用域强制
@@ -40,7 +40,7 @@ from __future__ import annotations
 
 from . import address, agent, auth, capability, delta, hub, queue, task, wire
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 PROTO = 2                  # 0.3 加了 rm（分发时同步删除）；旧节点会缺这一条
 NAME = "mesh"
 

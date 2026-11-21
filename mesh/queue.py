@@ -46,6 +46,7 @@ __all__ = [
     "QueueError", "Job", "Queue",
     "BLOCKED", "QUEUED", "RUNNING", "DONE", "FAILED", "CANCELED",
     "STATES", "TERMINAL", "DEFAULT_LEASE", "DEFAULT_MAX_ATTEMPTS",
+    "DELIVERY_PENDING", "DELIVERY_DONE", "DELIVERY_FAILED", "DELIVERY_STATES",
 ]
 
 # -- 状态 ----------------------------------------------------------------
@@ -58,6 +59,12 @@ CANCELED = "canceled"
 
 STATES = (BLOCKED, QUEUED, RUNNING, DONE, FAILED, CANCELED)
 TERMINAL = (DONE, FAILED, CANCELED)
+
+# 产物补送的状态（和作业状态机无关，别和上面那几个混用）
+DELIVERY_PENDING = "pending"     # 等下一次重试（网络问题、目标暂时离线）
+DELIVERY_DONE = "done"           # 送到了
+DELIVERY_FAILED = "failed"       # 试够了，或者错误重试也没用（只读 root、根不存在）
+DELIVERY_STATES = (DELIVERY_PENDING, DELIVERY_DONE, DELIVERY_FAILED)
 
 DEFAULT_LEASE = 180.0          # 租约秒数
 DEFAULT_MAX_ATTEMPTS = 2       # agent 最多试几次
@@ -150,6 +157,28 @@ CREATE TABLE IF NOT EXISTS tokens (
     perms_json TEXT NOT NULL DEFAULT '[]',
     created_at REAL NOT NULL
 );
+
+-- 补送表：作业已经 done，但产物没送到某个目标节点。
+-- 和作业分开记是关键 —— 作业本身成功了，重跑它会把同一份改动做两次；
+-- 而"没送到"是另一件事，该单独重试、单独有终态。
+CREATE TABLE IF NOT EXISTS deliveries (
+    id          TEXT PRIMARY KEY,
+    job_id      TEXT NOT NULL,
+    project     TEXT NOT NULL DEFAULT '',
+    to_addr     TEXT NOT NULL,
+    node        TEXT NOT NULL,
+    root        TEXT NOT NULL,
+    paths_json  TEXT NOT NULL DEFAULT '[]',
+    state       TEXT NOT NULL DEFAULT 'pending',
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    next_at     REAL NOT NULL DEFAULT 0,
+    last_error  TEXT NOT NULL DEFAULT '',
+    created_at  REAL NOT NULL,
+    updated_at  REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_deliveries_due ON deliveries(state, next_at);
+CREATE INDEX IF NOT EXISTS idx_deliveries_job ON deliveries(job_id);
 """
 
 
@@ -812,6 +841,101 @@ class Queue(object):
             else:
                 raise QueueError("要删令牌就得给 label 或 token_hash")
             return cur.rowcount > 0
+
+    # ------------------------------------------------------------------
+    # 产物补送表
+    # ------------------------------------------------------------------
+    def record_delivery(self, delivery_id, job_id, project, to_addr, node, root,
+                        paths=None, state=DELIVERY_PENDING, error="",
+                        attempts=0, next_at=0.0, now=None):
+        """记下一个"作业已 done、产物送没送到"的行。同一个 id 重复写就更新。
+
+        写入即覆盖：重推（``mesh sync``）会把 attempts 和 next_at 一起清掉，
+        所以人工介入之后补送的下一次重试是立刻发生的，不用等退避。
+        """
+        now = now or time.time()
+        with self._lock:
+            self._db.execute(
+                """INSERT INTO deliveries (
+                       id, job_id, project, to_addr, node, root, paths_json,
+                       state, attempts, next_at, last_error, created_at, updated_at
+                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(id) DO UPDATE SET
+                       to_addr=excluded.to_addr, node=excluded.node, root=excluded.root,
+                       paths_json=excluded.paths_json, state=excluded.state,
+                       attempts=excluded.attempts, next_at=excluded.next_at,
+                       last_error=excluded.last_error, updated_at=excluded.updated_at""",
+                (delivery_id, job_id, project or "", to_addr, node, root,
+                 json.dumps(list(paths or []), ensure_ascii=False), state,
+                 int(attempts), float(next_at), error or "", now, now))
+        return delivery_id
+
+    def due_deliveries(self, now=None, limit=10):
+        """到点该补送的行（按 next_at 先后）。"""
+        now = now or time.time()
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT * FROM deliveries WHERE state=? AND next_at <= ? "
+                "ORDER BY next_at ASC, id ASC LIMIT ?",
+                (DELIVERY_PENDING, now, int(limit))).fetchall()
+        return [self._delivery_row(r) for r in rows]
+
+    def update_delivery(self, delivery_id, state=None, error=None,
+                        attempts=None, next_at=None, now=None):
+        now = now or time.time()
+        sets, args = ["updated_at=?"], [now]
+        for column, value in (("state", state), ("last_error", error),
+                              ("attempts", attempts), ("next_at", next_at)):
+            if value is None:
+                continue
+            sets.append("%s=?" % column)
+            args.append(float(value) if column == "next_at" else
+                        int(value) if column == "attempts" else value)
+        args.append(delivery_id)
+        with self._lock:
+            cur = self._db.execute(
+                "UPDATE deliveries SET %s WHERE id=?" % ", ".join(sets), args)
+        return cur.rowcount > 0
+
+    def deliveries(self, job_id=None, state=None, limit=None):
+        sql = "SELECT * FROM deliveries WHERE 1=1"
+        args = []
+        if job_id:
+            sql += " AND job_id=?"
+            args.append(job_id)
+        if state:
+            sql += " AND state=?"
+            args.append(state)
+        sql += " ORDER BY created_at ASC, id ASC"
+        if limit:
+            sql += " LIMIT ?"
+            args.append(int(limit))
+        with self._lock:
+            rows = self._db.execute(sql, args).fetchall()
+        return [self._delivery_row(r) for r in rows]
+
+    def forget_deliveries(self, job_id):
+        """删掉一条作业的补送记录（换目标重推之前先清干净）。"""
+        with self._lock:
+            cur = self._db.execute("DELETE FROM deliveries WHERE job_id=?", (job_id,))
+        return cur.rowcount
+
+    def delivery_stats(self):
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT state, COUNT(*) AS cnt FROM deliveries GROUP BY state").fetchall()
+        return {r["state"]: r["cnt"] for r in rows}
+
+    @staticmethod
+    def _delivery_row(row):
+        return {
+            "id": row["id"], "job_id": row["job_id"], "project": row["project"],
+            "to": row["to_addr"], "node": row["node"], "root": row["root"],
+            "paths": _loads(row["paths_json"], []), "state": row["state"],
+            "attempts": row["attempts"], "next_at": row["next_at"],
+            "error": row["last_error"], "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
 
     # ------------------------------------------------------------------
     # 查询帮助函数
