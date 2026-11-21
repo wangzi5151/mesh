@@ -306,6 +306,28 @@ class Node(object):
             raise
         return {"sha": hashlib.sha256(data).hexdigest(), "size": len(data)}
 
+    def op_rm(self, payload):
+        """删一个文件 —— 分发时"源那边删了"要能在目标上同样删掉。
+
+        只删文件：删目录等于把一个子树的删除语义（空目录？递归？）塞进一个
+        RPC，那件事该由作业自己用 ``exec`` 干。root 是 ``ro`` 的照样拒绝。
+        """
+        path = self.resolve(payload.get("addr") or "", "write")
+
+        scope = payload.get("scope") or []
+        if scope:
+            rel = os.path.relpath(path, self._root_path_for(payload.get("addr")))
+            rel = rel.replace(os.sep, "/")
+            if not any(task.glob_match(g, rel) for g in scope):
+                raise AgentError("删除 %s 超出作业作用域 %s" % (rel, scope))
+
+        if os.path.isdir(path) and not os.path.islink(path):
+            raise AgentError("rm 只删文件，不删目录：%s" % path)
+        if not os.path.lexists(path):
+            return {"removed": False, "existed": False}
+        os.remove(path)
+        return {"removed": True, "existed": True}
+
     def _root_path_for(self, addr):
         addr = _parse_addr(addr)
         root = self.roots.get(addr.root)
@@ -658,6 +680,7 @@ class Node(object):
         srv.add("stat", self.op_stat)
         srv.add("read", self.op_read)
         srv.add("write", self.op_write)
+        srv.add("rm", self.op_rm)
         srv.add("sig", self.op_sig)
         srv.add("delta", self.op_delta)
         srv.add("patch", self.op_patch)

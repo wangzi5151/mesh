@@ -45,7 +45,8 @@
       "write": ["post.md"],
       "deps": ["draft", "facts"],
       "agent": "cli",
-      "max_attempts": 1
+      "max_attempts": 1,
+      "sync": ["mesh://笔记本/work"]
     }
   ]
 }

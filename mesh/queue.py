@@ -77,6 +77,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     prompt          TEXT NOT NULL DEFAULT '',
     read_json       TEXT NOT NULL DEFAULT '[]',
     write_json      TEXT NOT NULL DEFAULT '[]',
+    sync_json       TEXT NOT NULL DEFAULT '[]',
     priority        INTEGER NOT NULL DEFAULT 0,
     req_json        TEXT NOT NULL DEFAULT '{}',
     agent           TEXT NOT NULL DEFAULT '',
@@ -169,7 +170,7 @@ class Job(object):
         "id", "project", "title", "prompt", "read", "write", "priority", "req",
         "agent", "cmd", "model", "verify", "state", "attempts", "max_attempts",
         "lease_owner", "lease_expires", "feedback", "result", "error",
-        "created_at", "updated_at", "started_at", "finished_at", "deps",
+        "created_at", "updated_at", "started_at", "finished_at", "deps", "sync",
     )
 
     def __init__(self, job_id="", project="", **kw):
@@ -198,6 +199,8 @@ class Job(object):
         self.started_at = float(kw.get("started_at") or 0.0)
         self.finished_at = float(kw.get("finished_at") or 0.0)
         self.deps = list(kw.get("deps") or [])
+        # 产物分发目标（原样存计划里的写法，由 hub 解析成 task.SyncTarget）
+        self.sync = list(kw.get("sync") or [])
 
     # -- 派生 ------------------------------------------------------------
     @property
@@ -220,6 +223,7 @@ class Job(object):
             "feedback": self.feedback, "result": self.result, "error": self.error,
             "created_at": self.created_at, "updated_at": self.updated_at,
             "started_at": self.started_at, "finished_at": self.finished_at,
+            "sync": self.sync,
         }
 
     @classmethod
@@ -239,6 +243,7 @@ class Job(object):
             title=row["title"], prompt=row["prompt"],
             read=_loads(row["read_json"], []),
             write=_loads(row["write_json"], []),
+            sync=_loads(row["sync_json"], []),
             priority=row["priority"],
             req=_loads(row["req_json"], {}),
             agent=row["agent"], cmd=row["cmd"], model=row["model"],
@@ -288,12 +293,27 @@ class Queue(object):
             self._db.execute("PRAGMA foreign_keys=ON")
             self._db.execute("PRAGMA busy_timeout=30000")
             self._db.executescript(SCHEMA)
+            self._migrate()
         if self.path != ":memory:":
             # 令牌和节点口令都在这个文件里 —— 别让同组用户顺手读走
             try:
                 os.chmod(self.path, 0o600)
             except OSError:
                 pass
+
+    def _migrate(self):
+        """给 0.2 及更早的库补列。
+
+        ``CREATE TABLE IF NOT EXISTS`` 对已存在的表一句话都不说，所以老库
+        不会自动长出新列 —— 一个 0.2 的 ``mesh.db`` 直接跑 0.3 会在 INSERT 上炸。
+        这里按 ``PRAGMA table_info`` 补，不重建表、不动数据。
+        """
+        with self._lock:
+            cols = {r["name"] for r in self._db.execute("PRAGMA table_info(jobs)")}
+            if "sync_json" not in cols:
+                self._db.execute(
+                    "ALTER TABLE jobs ADD COLUMN sync_json TEXT NOT NULL DEFAULT '[]'")
+        return True
 
     def close(self):
         with self._lock:
@@ -334,8 +354,9 @@ class Queue(object):
                         id, project, title, prompt, read_json, write_json, priority,
                         req_json, agent, cmd, model, verify, state, attempts,
                         max_attempts, lease_owner, lease_expires, feedback,
-                        result_json, error, created_at, updated_at, started_at, finished_at
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        result_json, error, created_at, updated_at, started_at,
+                        finished_at, sync_json
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         job.id, job.project, job.title, job.prompt,
                         json.dumps(job.read, ensure_ascii=False),
@@ -348,6 +369,7 @@ class Queue(object):
                         json.dumps(job.result, ensure_ascii=False) if job.result is not None else "",
                         job.error, job.created_at, job.updated_at,
                         job.started_at, job.finished_at,
+                        json.dumps(job.sync, ensure_ascii=False),
                     ))
                 for dep in job.deps:
                     self._db.execute(
@@ -532,6 +554,25 @@ class Queue(object):
                  feedback or "", now, now, job_id))
             self._db.execute("COMMIT")
         self._event("complete", job_id, "", {"result": result, "feedback": feedback})
+
+    def update_result(self, job_id, result):
+        """只换结果，不动状态（重推产物之后记账用）。
+
+        ``complete`` 会把作业状态和结束时间一起写掉，重推不该改这些 ——
+        作业早就成功了，这次只是"产物又送了一遍"。
+        """
+        now = time.time()
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            cur = self._db.execute(
+                "UPDATE jobs SET result_json=?, updated_at=? WHERE id=?",
+                (json.dumps(result, ensure_ascii=False) if result is not None else "",
+                 now, job_id))
+            self._db.execute("COMMIT")
+            if cur.rowcount == 0:
+                raise QueueError("作业不存在：%s" % job_id)
+        self._event("result", job_id, "", {"result": result})
+        return True
 
     def fail(self, job_id, error=None, feedback=None, retryable=True):
         now = time.time()

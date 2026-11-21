@@ -333,10 +333,11 @@ class TestJobModel(unittest.TestCase):
                "state": "queued", "attempts": 0, "max_attempts": 2,
                "lease_owner": "", "lease_expires": 0, "feedback": "",
                "result_json": "", "error": "", "created_at": 1, "updated_at": 1,
-               "started_at": 0, "finished_at": 0}
+               "started_at": 0, "finished_at": 0, "sync_json": "[]"}
         j = Q.Job.from_row(row)
         self.assertEqual(j.read, [])
         self.assertEqual(j.req, {})
+        self.assertEqual(j.sync, [])
 
 
 # --------------------------------------------------------------------------

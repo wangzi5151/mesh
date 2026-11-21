@@ -377,6 +377,10 @@ def _summary_line(report, prev=None):
         parts.append("退回 %d" % len(unleased))
     if reaped:
         parts.append("回收 %d" % len(reaped))
+    # 分发失败不改作业状态，所以必须单独说出来 —— 否则它就静默地没送到
+    sync_errors = report.get("sync_errors") or []
+    if sync_errors:
+        parts.append("分发失败 %d" % len(sync_errors))
     if not parts:
         return "", state
     return "[%s] %s" % (time.strftime("%H:%M:%S"), "，".join(parts)), state
@@ -417,6 +421,16 @@ def cmd_plan(args):
             _out("  %s ↔ %s（%s / %s）" % (a, b, ga, gb))
     else:
         _out("写作用域没有冲突")
+    targets = plan.sync_targets()
+    if targets:
+        _out("产物分发 %d 处：" % len(targets))
+        for target in targets:
+            users = [t.id for t in plan.tasks
+                     if any(x.key() == target.key()
+                            for x in task.merge_sync(plan.sync, t.sync))]
+            _out("  %s  ←  %s%s" % (
+                target, " ".join(sorted(users)),
+                "（只推 %s）" % " ".join(target.paths) if target.paths else ""))
     if args.json:
         _out(json.dumps(plan.to_dict(), ensure_ascii=False, indent=2))
     return EXIT_OK
@@ -547,6 +561,78 @@ def cmd_cancel(args):
     finally:
         queue.close()
     return EXIT_OK
+
+
+def cmd_sync(args):
+    """重推产物：目标当时离线、或者想再发一遍的时候用。"""
+    hub = hub_mod.Hub(args.db, mirror=args.mirror,
+                      ca=getattr(args, "tls_ca", None),
+                      tls_insecure=getattr(args, "tls_insecure", False))
+    try:
+        failed = 0
+        for job_id in args.job_id:
+            try:
+                report = hub.sync_job(job_id, targets=args.to)
+            except hub_mod.HubError as exc:
+                _out("%s：%s" % (job_id, exc))
+                failed += 1
+                continue
+
+            if args.json:
+                _out(json.dumps(report, ensure_ascii=False, indent=2))
+                continue
+
+            _out("%s  源 mesh://%s/%s" % (job_id, report["node"], report["root"]))
+            if report["targets"]:
+                rows = []
+                for t in report["targets"]:
+                    if t["skipped"]:
+                        state = t["skipped"]
+                    elif not t["ok"]:
+                        state = "失败：%s" % "；".join(t["errors"][:2])
+                    else:
+                        state = "已同步"
+                    modes = {}
+                    for f in t["files"]:
+                        modes[f["mode"]] = modes.get(f["mode"], 0) + 1
+                    rows.append([t["to"], _count_modes(modes),
+                                 _bytes_human(t["sent"]), _bytes_human(t["size"]),
+                                 (_saved_text(t) if t["size"] else "-"), state])
+                _out(table(rows, ["目标", "文件", "传输", "大小", "省", "状态"]))
+            for err in report["errors"]:
+                _out("  失败  %s" % err)
+            if not report["ok"]:
+                failed += 1
+        return EXIT_OK if failed == 0 else 1
+    finally:
+        hub.close()
+
+
+def _count_modes(modes):
+    """``{'delta': 2, 'same': 1}`` → ``差分 2 / 相同 1``。"""
+    labels = {"delta": "差分", "full": "整取", "same": "相同",
+              "delete": "删除", "absent": "已无"}
+    total = sum(modes.values())
+    if not total:
+        return "-"
+    parts = ["%s %d" % (labels.get(k, k), n) for k, n in sorted(modes.items())]
+    return "%d（%s）" % (total, "，".join(parts))
+
+
+def _bytes_human(size):
+    size = float(size or 0)
+    for unit in ("B", "KB", "MB"):
+        if size < 1024 or unit == "MB":
+            return ("%d %s" % (size, unit)) if unit == "B" else ("%.1f %s" % (size, unit))
+        size /= 1024.0
+    return "%.1f MB" % size
+
+
+def _saved_text(target):
+    if not target["size"]:
+        return "-"
+    saved = max(0, target["size"] - target["sent"])
+    return "%.0f%%" % (100.0 * saved / float(target["size"]))
 
 
 # --------------------------------------------------------------------------
@@ -796,6 +882,19 @@ def build_parser():
     p.add_argument("--db", default="mesh.db")
     p.add_argument("--reason", default=None)
     p.set_defaults(func=cmd_cancel)
+
+    # -- sync
+    p = sub.add_parser("sync", help="把已完成的作业产物重新推给目标节点")
+    p.add_argument("job_id", nargs="+")
+    p.add_argument("--db", default="mesh.db")
+    p.add_argument("--mirror", metavar="DIR",
+                   help="产物镜像目录（有就直接用本地的，省一趟源节点往返）")
+    p.add_argument("--to", action="append", metavar="ADDR",
+                   help="临时指定目标（mesh://节点/root），可重复；不给就用计划里的")
+    p.add_argument("--tls-ca", metavar="FILE", help="连节点时用来校验的 CA")
+    p.add_argument("--tls-insecure", action="store_true", help="连节点时不校验证书")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_sync)
 
     # -- nodes
     p = sub.add_parser("nodes", help="管理节点清单（存在库里，重启不丢）")

@@ -18,9 +18,9 @@
 ``task``      任务图：DAG 校验、批次、写作用域
 ``wire``      零依赖 HTTP + JSON-RPC（客户端与服务端）
 ``agent``     节点 agent：路径围栏、只读 root、作用域强制
-``hub``       控制面：心跳、派发、失败重试、产物回收、面板
+``hub``       控制面：心跳、派发、失败重试、产物回收与分发、面板
 ``auth``      令牌与权限：项目隔离、只读/可提交/可管理
-``cli``       命令行：node / hub / submit / nodes / token / status / doctor
+``cli``       命令行：node / hub / submit / nodes / token / status / sync / doctor
 ============  ==========================================================
 
 最省事的起法（两台机器，同一个局域网）::
@@ -40,8 +40,8 @@ from __future__ import annotations
 
 from . import address, agent, auth, capability, delta, hub, queue, task, wire
 
-__version__ = "0.2.0"
-PROTO = 1
+__version__ = "0.3.0"
+PROTO = 2                  # 0.3 加了 rm（分发时同步删除）；旧节点会缺这一条
 NAME = "mesh"
 
 __all__ = [

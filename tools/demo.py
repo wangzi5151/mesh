@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""端到端演示：一个节点 + 一个控制面 + 一份 3 条任务的 DAG，跑完打印结果。
+"""端到端演示：两个节点 + 一个控制面 + 一份 3 条任务的 DAG，跑完打印结果。
 
     python3 tools/demo.py
 
-不联网、不要 ip、不要第三方包 —— 全在一条进程里跑，用来确认"调度这条路通了"。
+第 1 个节点干活，产物按增量收回来，再**推给第 2 个节点** —— 这就是
+"在 A 上改完，B 上也自动有了"。不联网、不要 ip、不要第三方包，全在一条进程里跑。
+
 真实用法见 README（节点跑在另一台机器上，``mesh node`` / ``mesh hub``）。
 """
 
@@ -19,8 +21,22 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from mesh import agent, hub  # noqa: E402
 
 
+def peek(path, limit=24):
+    """文件内容的一小段：够看出对不对，又不至于把终端刷满。"""
+    with open(path, "r", encoding="utf-8") as f:
+        body = f.read()
+    text = body.replace("\n", "\\n")
+    if len(text) > limit:
+        text = text[:limit] + "…"
+    return "%6d B  %r" % (os.path.getsize(path), text)
+
+
 def main():
-    work = tempfile.mkdtemp(prefix="mesh-demo-")
+    root = tempfile.mkdtemp(prefix="mesh-demo-")
+    work = os.path.join(root, "手机")
+    peer = os.path.join(root, "镜像")
+    os.makedirs(work)
+    os.makedirs(peer)
 
     def runner(job):
         """假装是个 agent：把提示词写进第一个写作用域文件；有依赖就接在上游产物后面。"""
@@ -33,26 +49,38 @@ def main():
             f.write(body)
         return {"stdout": "写入 %s（%d 字节）" % (job.write[0], len(body))}
 
-    node = agent.Node("demo", roots=[{"name": "work", "path": work, "mode": "rw"}],
+    node = agent.Node("手机", roots=[{"name": "work", "path": work, "mode": "rw"}],
                       slots_total=2, tags=["demo"], runner=runner)
     server = node.build_server(port=0)
     server.start()
 
-    plane = hub.Hub(":memory:", poll=0.05)
-    plane.add_node("demo", server.url)
+    # 第二个节点：不干活，只当"另一台机器"，让产物自己飘过去
+    mirror_node = agent.Node("笔记本", roots=[{"name": "work", "path": peer, "mode": "rw"}],
+                             runner=lambda job: {"stdout": "不干活"})
+    mirror_server = mirror_node.build_server(port=0)
+    mirror_server.start()
+
+    plane = hub.Hub(":memory:", poll=0.05, mirror=os.path.join(root, "产物"))
+    plane.add_node("手机", server.url)
+    plane.add_node("笔记本", mirror_server.url)
     ids = plane.submit({
         "project": "demo",
         "tasks": [
-            {"id": "t1", "title": "打地基", "prompt": "第一行\n",
-             "write": ["a.txt"]},
+            # 第一段写长一点：t2 只是往后面追一行，推给第二台机器时才看得出差分
+            {"id": "t1", "title": "打地基", "prompt": "第一行\n" * 2400,
+             "write": ["a.txt"], "req": {"tags": ["demo"]},
+             "sync": ["mesh://笔记本/work"]},
             {"id": "t2", "title": "接上去", "prompt": "第二行\n",
-             "write": ["a.txt"], "deps": ["t1"]},
+             "write": ["a.txt"], "deps": ["t1"], "req": {"tags": ["demo"]},
+             "sync": ["mesh://笔记本/work"]},
             {"id": "t3", "title": "另一条线", "prompt": "自己一份\n",
-             "write": ["b.txt"]},
+             "write": ["b.txt"], "req": {"tags": ["demo"]},
+             "sync": ["mesh://笔记本/work"]},
         ],
     })
 
-    print("节点   %s  %s" % (node.node_id, server.url))
+    print("节点   手机 %s（干活）" % server.url)
+    print("节点   笔记本 %s（收产物）" % mirror_server.url)
     print("提交   %d 条作业：%s" % (len(ids), " ".join(ids)))
     print()
 
@@ -71,16 +99,27 @@ def main():
         for name in sorted(os.listdir(work)):
             path = os.path.join(work, name)
             if os.path.isfile(path):
-                with open(path, "r", encoding="utf-8") as f:
-                    print("  %-8s %r" % (name, f.read()))
+                print("  手机   %-6s %s" % (name, peek(path)))
+        for name in sorted(os.listdir(peer)):
+            path = os.path.join(peer, name)
+            if os.path.isfile(path):
+                print("  笔记本 %-6s %s" % (name, peek(path)))
         print()
         for job in plane.jobs(project="demo"):
-            print("  %-4s %-7s 尝试 %d  %s"
-                  % (job.id, job.state, job.attempts, job.feedback))
+            sync = (job.result or {}).get("sync") or {}
+            hop = ""
+            if sync.get("targets"):
+                modes = [f["mode"] for t in sync["targets"] for f in t["files"]]
+                hop = "  分发 %s（%d B / %d B）" % (
+                    "/".join(sorted(set(modes))) or "-", sync.get("sent", 0),
+                    sync.get("size", 0))
+            print("  %-4s %-7s 尝试 %d  %s%s"
+                  % (job.id, job.state, job.attempts, job.feedback, hop))
     finally:
         server.stop()
+        mirror_server.stop()
         plane.close()
-        shutil.rmtree(work, ignore_errors=True)
+        shutil.rmtree(root, ignore_errors=True)
 
     return 0
 

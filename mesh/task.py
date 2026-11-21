@@ -25,9 +25,12 @@ from __future__ import annotations
 
 import fnmatch
 
+from . import address
+
 __all__ = [
-    "PlanError", "TaskSpec", "Plan",
+    "PlanError", "TaskSpec", "Plan", "SyncTarget",
     "glob_match", "globs_may_overlap", "check_scope", "in_scope", "static_prefix",
+    "merge_sync",
 ]
 
 MAX_DEPTH = 64          # glob 递归深度上限，防病态模式
@@ -132,6 +135,131 @@ def check_scope(job, changed_paths, mode="write"):
 
 
 # --------------------------------------------------------------------------
+# 分发目标
+# --------------------------------------------------------------------------
+class SyncTarget(object):
+    """这条作业改过的文件，除了收回控制面，还要同步到哪个节点的哪个 root。
+
+    产物回收（``hub.collect``）只把文件从节点收回控制面；"A 机器改完自动到
+    B 机器"必须显式说出来，所以任务里有 ``sync`` 字段。两种写法::
+
+        "sync": ["mesh://笔记本/work"]                        # 全部改动
+        "sync": [{"to": "mesh://树莓派/store", "paths": ["docs/**"]}]
+
+    ``paths`` 是相对路径的 glob 过滤器（:func:`glob_match`），留空表示全部。
+    字符串形式里带路径就当过滤器：``mesh://笔记本/work/docs`` 只同步 ``docs/`` 下面。
+    """
+
+    __slots__ = ("node", "env", "root", "paths")
+
+    def __init__(self, node, env="", root="", paths=None):
+        self.node = node
+        self.env = env
+        self.root = root
+        self.paths = list(paths or [])
+
+    # -- 构造 ------------------------------------------------------------
+    @classmethod
+    def from_any(cls, obj):
+        """字符串 / 对象 / 已解析的目标 → :class:`SyncTarget`（总是返回新对象）。"""
+        if isinstance(obj, SyncTarget):
+            return cls(obj.node, obj.env, obj.root, list(obj.paths))
+        if isinstance(obj, str):
+            return cls._from_str(obj)
+        if isinstance(obj, dict):
+            text = obj.get("to") or obj.get("addr") or ""
+            if not text:
+                raise PlanError("分发目标缺少 to：%r" % (obj,))
+            target = cls._from_str(text)
+            if obj.get("paths") is not None:
+                target.paths = _clean_paths(obj.get("paths"))
+            return target
+        raise PlanError("分发目标必须是字符串或对象，收到 %s" % type(obj).__name__)
+
+    @classmethod
+    def _from_str(cls, text):
+        try:
+            addr = address.parse(text)
+        except address.AddressError as exc:
+            raise PlanError("分发目标地址不合法：%s" % exc)
+        if addr.is_wildcard:
+            # 通配等于"所有节点"，分发到所有节点没法说清谁该收，挡在计划阶段
+            raise PlanError("分发目标不能是通配节点：%r" % (text,))
+        if not addr.root:
+            raise PlanError("分发目标必须写到 root（mesh://节点/root）：%r" % (text,))
+        paths = []
+        if addr.path:
+            paths = [addr.path, addr.path + "/**"]
+        return cls(addr.node, addr.env, addr.root, paths)
+
+    # -- 序列化 ----------------------------------------------------------
+    def to_dict(self):
+        out = {"to": str(self)}
+        if self.paths:
+            out["paths"] = list(self.paths)
+        return out
+
+    def key(self):
+        return (self.node, self.env, self.root)
+
+    def accepts(self, rel):
+        """这个相对路径要不要同步过去。"""
+        if not self.paths:
+            return True
+        return any(glob_match(p, rel) for p in self.paths)
+
+    def __str__(self):
+        out = address.SCHEME + self.node
+        if self.env:
+            out += "/" + self.env + ":" + self.root
+        else:
+            out += "/" + self.root
+        return out
+
+    def __repr__(self):
+        return "SyncTarget(%s, paths=%s)" % (str(self), self.paths)
+
+
+def _clean_paths(paths):
+    """过滤器列表：允许单个字符串，逐个校验非空。"""
+    if isinstance(paths, str):
+        paths = [paths]
+    if not isinstance(paths, (list, tuple)):
+        raise PlanError("分发目标的 paths 必须是列表")
+    out = []
+    for pat in paths:
+        if not isinstance(pat, str) or not pat.strip():
+            raise PlanError("分发目标的 paths 里有空模式：%r" % (pat,))
+        out.append(pat.strip().lstrip("/"))
+    return out
+
+
+def merge_sync(*groups):
+    """把多组分发目标合并去重。
+
+    同一个 ``节点/root`` 写了两次时合并过滤器：任意一处留空（=全部）就按全部算，
+    否则取并集。返回的总是新对象，改它不会影响计划里的原值。
+    """
+    order, by_key = [], {}
+    for group in groups:
+        for item in group or []:
+            target = SyncTarget.from_any(item)
+            key = target.key()
+            if key not in by_key:
+                by_key[key] = target
+                order.append(key)
+                continue
+            current = by_key[key]
+            if not current.paths or not target.paths:
+                current.paths = []
+            else:
+                for pat in target.paths:
+                    if pat not in current.paths:
+                        current.paths.append(pat)
+    return [by_key[k] for k in order]
+
+
+# --------------------------------------------------------------------------
 # 任务规格
 # --------------------------------------------------------------------------
 
@@ -139,7 +267,7 @@ class TaskSpec(object):
     """一条任务的定义（还没进队列）。"""
 
     __slots__ = ("id", "title", "prompt", "read", "write", "deps", "verify",
-                 "agent", "cmd", "model", "req", "priority", "max_attempts")
+                 "agent", "cmd", "model", "req", "priority", "max_attempts", "sync")
 
     def __init__(self, task_id="", **kw):
         self.id = task_id
@@ -156,6 +284,8 @@ class TaskSpec(object):
         self.priority = int(kw.get("priority") or 0)
         # 0 表示"用队列的默认值"。会写坏东西的任务该给 1 次，别让它重复踩。
         self.max_attempts = int(kw.get("max_attempts") or 0)
+        # 这条作业的产物要同步到哪些节点的哪些 root（收回来之后再推出去）
+        self.sync = merge_sync(kw.get("sync"))
 
     def to_dict(self):
         return {
@@ -164,6 +294,7 @@ class TaskSpec(object):
             "verify": self.verify, "agent": self.agent, "cmd": self.cmd,
             "model": self.model, "req": self.req, "priority": self.priority,
             "max_attempts": self.max_attempts,
+            "sync": [t.to_dict() for t in self.sync],
         }
 
     @classmethod
@@ -175,8 +306,8 @@ class TaskSpec(object):
             raise PlanError("任务缺少 id")
         return cls(task_id, **{k: v for k, v in obj.items() if k != "id"})
 
-    def to_job(self, project):
-        """转成队列里的 Job。"""
+    def to_job(self, project, default_sync=None):
+        """转成队列里的 Job。``default_sync`` 是计划级的分发默认值。"""
         from .queue import Job
         return Job(
             self.id, project, title=self.title, prompt=self.prompt,
@@ -184,6 +315,7 @@ class TaskSpec(object):
             priority=self.priority, req=self.req, agent=self.agent,
             cmd=self.cmd, model=self.model, verify=self.verify,
             max_attempts=self.max_attempts,
+            sync=[t.to_dict() for t in merge_sync(default_sync, self.sync)],
         )
 
     def __repr__(self):
@@ -197,9 +329,12 @@ class TaskSpec(object):
 class Plan(object):
     """一组任务构成的 DAG。构造后请调 :meth:`validate`。"""
 
-    def __init__(self, project, tasks=None):
+    def __init__(self, project, tasks=None, sync=None):
         self.project = project
         self.tasks = list(tasks or [])
+        # 计划级的分发默认值：写一次，所有作业都往这几个 root 推。
+        # 和任务自己的 sync 合并（同一目标合并过滤器，见 merge_sync）。
+        self.sync = merge_sync(sync)
 
     # -- 构造 ------------------------------------------------------------
     @classmethod
@@ -210,12 +345,15 @@ class Plan(object):
         if not project:
             raise PlanError("计划缺少 project")
         tasks = [TaskSpec.from_dict(t) for t in (obj.get("tasks") or [])]
-        plan = cls(project, tasks)
+        plan = cls(project, tasks, sync=obj.get("sync"))
         plan.validate()
         return plan
 
     def to_dict(self):
-        return {"project": self.project, "tasks": [t.to_dict() for t in self.tasks]}
+        out = {"project": self.project, "tasks": [t.to_dict() for t in self.tasks]}
+        if self.sync:
+            out["sync"] = [t.to_dict() for t in self.sync]
+        return out
 
     # -- 校验 ------------------------------------------------------------
     def validate(self):
@@ -235,6 +373,15 @@ class Plan(object):
             for dep in task.deps:
                 if dep not in seen:
                     raise PlanError("任务 %s 依赖了不存在的 %s" % (task.id, dep))
+
+        # 分发目标在提交前就要能解析：写错了别等到作业跑完、产物要推的时候才发现。
+        # （节点在不在线另说 —— 那是运行期的事。）
+        try:
+            merge_sync(self.sync, *[t.sync for t in self.tasks])
+        except PlanError:
+            raise
+        except Exception as exc:
+            raise PlanError("分发目标不合法：%s" % exc)
 
         self.topo_order()        # 有环会在这里抛
         return self
@@ -330,8 +477,13 @@ class Plan(object):
 
     # -- 输出 ------------------------------------------------------------
     def to_jobs(self):
-        """转成 Job 列表（按拓扑序）。"""
-        return [t.to_job(self.project) for t in self.topo_order()]
+        """转成 Job 列表（按拓扑序）。计划级 sync 在这里并进每条作业。"""
+        return [t.to_job(self.project, default_sync=self.sync)
+                for t in self.topo_order()]
+
+    def sync_targets(self):
+        """计划里出现过的所有分发目标（去重，用于 plan 预览）。"""
+        return merge_sync(self.sync, *[t.sync for t in self.tasks])
 
     def stats(self):
         return {
@@ -340,6 +492,7 @@ class Plan(object):
             "waves": len(self.waves()),
             "edges": sum(len(t.deps) for t in self.tasks),
             "conflicts": len(self.conflicts()),
+            "sync": len(self.sync_targets()),
         }
 
     def __len__(self):

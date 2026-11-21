@@ -1,4 +1,4 @@
-"""控制面：把作业派给合适的节点，把结果收回来。
+"""控制面：把作业派给合适的节点，把结果收回来，再推给别的节点。
 
 调度循环（:meth:`Hub.tick`）一轮做四件事：
 
@@ -6,6 +6,14 @@
 2. **心跳**：向每个节点要一份能力快照；连不上的立刻从调度池里摘掉
 3. **派发**：按优先级遍历就绪作业，用 :func:`capability.score` 挑节点
 4. **收尾**：成功 → ``complete``（解锁下游）；失败 → ``fail``（按 attempts 决定重试）
+
+成功收尾时还做两件数据面的事，结果跟着作业一起落库：
+
+* :meth:`Hub.collect` —— 把改过的文件收回镜像目录（只传增量）
+* :meth:`Hub.push` —— 按作业的 ``sync`` 把同一批文件推给别的节点（也是增量）
+
+分发失败**不**改作业状态：改动已经在源节点上落地了，判失败只会让人工重跑一遍、
+把同一份改动做两次。失败记在结果里，``mesh sync <作业>`` 可以原地重推。
 
 为什么是"先挑节点、再领作业"
 ----------------------------
@@ -22,7 +30,6 @@ import html
 import json
 import os
 import re
-import tempfile
 import threading
 import time
 import uuid
@@ -39,6 +46,7 @@ LEASE_MARGIN = 60.0          # 租约在派发超时之外额外留的余量（�
 DEFAULT_LEADER_TTL = 15.0    # 调度权租约：一个 tick 之内必须能续上
 MIRROR_CHUNK = 1 << 20
 MAX_SIG_BLOCKS_PULL = 96     # 拉产物时签名表最多这么多块（每块 ≈88 字节）
+MAX_PUSH_BYTES = 32 << 20    # 单个文件分发上限：JSON 里装 base64，再大就该用 exec 搬
 
 # 每个 RPC 方法需要什么权限。没列出来的方法一律按 admin 处理 —— 加了新方法
 # 忘了写在这里，是"默认更严"，不是"默认放行"。
@@ -71,24 +79,33 @@ def _block_for(size):
     return max(delta.MIN_BLOCK_SIZE, min(delta.MAX_BLOCK_SIZE, guess))
 
 
-def _mirror_path(base, rel):
-    """把节点报上来的相对路径落到镜像目录里，**不许逃出去**。
+def _rel_safe(rel):
+    """校验节点报上来的相对路径，返回规范化后的形式（``a/b/c``）。
 
     ``changed`` 是节点算出来的，正常情况下不会带 ``..``；但节点是不可信的一方，
-    一个改过的节点随手回一句 ``../../.ssh/authorized_keys`` 就能往控制面上写文件。
-    所以这里按段拼接并核对最终路径仍在 base 之内。
+    一个改过的节点随手回一句 ``../../.ssh/authorized_keys`` 就能往控制面上写文件、
+    或者把文件推到别的机器上的任意位置。所以逐段核对。
     """
     raw = str(rel or "").replace("\\", "/")
     if raw.startswith("/") or ":" in raw:
         # 绝对路径/带冒号：节点报这种路径本身就是异常信号，直接拒
         raise HubError("产物路径必须是相对路径：%r" % (raw,))
-    rel = raw.strip("/")
-    if not rel:
+    parts = [p for p in raw.strip("/").split("/") if p not in ("", ".")]
+    if not parts:
         raise HubError("产物路径不合法：%r" % (raw,))
-    parts = [p for p in rel.split("/") if p not in ("", ".")]
     if any(p == ".." for p in parts):
-        raise HubError("产物路径不合法（含 ..）：%r" % (rel,))
-    target = os.path.abspath(os.path.join(base, *parts))
+        raise HubError("产物路径不合法（含 ..）：%r" % (raw,))
+    return "/".join(parts)
+
+
+def _mirror_path(base, rel):
+    """把节点报上来的相对路径落到镜像目录里，**不许逃出去**。
+
+    路径本身由 :func:`_rel_safe` 校验，这里再核对最终路径仍在 base 之内
+    （``..`` 被挡住之后，剩下的风险是符号链接，abspath + 前缀比对能挡住）。
+    """
+    rel = _rel_safe(rel)
+    target = os.path.abspath(os.path.join(base, *rel.split("/")))
     root = os.path.abspath(base) + os.sep
     if not (target + os.sep).startswith(root):
         raise HubError("产物路径越界：%r" % (rel,))
@@ -107,6 +124,78 @@ def _safe_name(name):
 
 class HubError(Exception):
     """控制面拒绝：计划有冲突、节点未注册等。"""
+
+
+class _PushSource(object):
+    """分发时的"源头"：优先用镜像里刚收回来那份，没有就回源节点要。
+
+    开了 ``--mirror`` 的时候，文件收回来就已经在本地了 —— 再推给别的节点
+    不用问源节点第二遍，"收回来"这一步顺手成了分发的中转缓存。
+    没开镜像也能分发，代价是每个文件多一趟源节点往返。
+    """
+
+    __slots__ = ("hub", "node_id", "root", "rel", "_data", "_loaded")
+
+    def __init__(self, hub, node_id, root, rel):
+        self.hub = hub
+        self.node_id = node_id
+        self.root = root
+        self.rel = rel
+        self._data = None
+        self._loaded = False
+
+    def addr(self):
+        return "mesh://%s/%s/%s" % (self.node_id, self.root, self.rel)
+
+    def cached_path(self):
+        if not self.hub.mirror:
+            return ""
+        base = os.path.join(self.hub.mirror, _safe_name(self.node_id),
+                            _safe_name(self.root))
+        try:
+            return _mirror_path(base, self.rel)
+        except HubError:
+            return ""
+
+    def cached_bytes(self):
+        """镜像里那份的内容；没有就 None。读一次记住 —— 分一次文件要问它三回。"""
+        if not self._loaded:
+            path = self.cached_path()
+            self._data = None
+            if path and os.path.isfile(path):
+                with open(path, "rb") as f:
+                    self._data = f.read()
+            self._loaded = True
+        return self._data
+
+    def sha_size(self):
+        """源的 (sha256, 大小)。镜像里有就不用问节点。"""
+        data = self.cached_bytes()
+        if data is not None:
+            return delta.sha256_hex(data), len(data)
+        st = self.hub.client_for(self.node_id).stat(self.addr(), sha=True)
+        if not st.get("exists"):
+            raise HubError("源文件不存在：%s" % self.addr())
+        return str(st.get("sha") or ""), int(st.get("size") or 0)
+
+    def read(self):
+        data = self.cached_bytes()
+        if data is not None:
+            return data
+        return self.hub.client_for(self.node_id).read_all(self.addr())
+
+    def delta(self, sig, block, old_sha):
+        """拿**目标节点**给的签名表出差分。
+
+        有本地缓存就自己算（省一趟源节点往返），没有就让源节点算 ——
+        两种方式下签名表都由接收方出，这是 rsync 的方向，反了永远退化成整取。
+        """
+        data = self.cached_bytes()
+        if data is not None:
+            return delta.diff_with_sig(sig, data, block, old_sha=old_sha).to_dict()
+        packed = self.hub.client_for(self.node_id).mkdelta(
+            self.addr(), old_sha, block, sig)
+        return (packed or {}).get("delta") or {}
 
 
 class NodeRef(object):
@@ -301,9 +390,25 @@ class Hub(object):
 
             report["dispatched"].append({"job": leased.id, "node": cap.node_id})
             if outcome.get("ok"):
+                root = self._root_for(leased, cap)
+                # 记下产物是从哪来的：之后重推（mesh sync）靠它找回源头
+                outcome["node"] = cap.node_id
+                outcome["root"] = root
                 if self.mirror:
                     # 产物在 complete 之前收：收的结果要跟着作业一起落库
                     outcome["artifacts"] = self.collect(leased, cap, outcome)
+                if leased.sync:
+                    # 分发失败不改作业状态 —— 改动已经在源节点上落地了，
+                    # 把作业判失败只会让人工重跑一遍、把同一份改动做两次。
+                    try:
+                        outcome["sync"] = self.push(leased, cap.node_id, root, outcome)
+                    except Exception as exc:        # noqa: BLE001 - 见上面这段
+                        outcome["sync"] = {"ok": False, "targets": [],
+                                           "errors": ["分发异常：%s" % exc]}
+                    if not outcome["sync"].get("ok"):
+                        report.setdefault("sync_errors", []).append(
+                            {"job": leased.id,
+                             "errors": (outcome["sync"].get("errors") or [])[:5]})
                 self.queue.complete(
                     leased.id, result=outcome,
                     feedback=(outcome.get("stdout") or "")[:1000])
@@ -426,10 +531,12 @@ class Hub(object):
                 sent_up, sent_down, mode = up, down, "delta"
             else:
                 # 小文件/大改：差分的额外开销比整取还贵，直接整取
-                new = client.read(addr)
+                new = client.read_all(addr)
                 sent_down = len(new)
         else:
-            new = client.read(addr)
+            # 注意用 read_all 而不是 read：单次 read 被节点截在 8MB，
+            # 直接读会悄悄拿到半个文件，之后这份镜像就成了错的差分基线。
+            new = client.read_all(addr)
             sent_down = len(new)
         sent = sent_up + sent_down
 
@@ -443,6 +550,178 @@ class Hub(object):
         os.replace(tmp, local)
         return {"path": rel, "mode": mode, "sent": sent, "size": len(new),
                 "sent_up": sent_up, "sent_down": sent_down}
+
+    # ------------------------------------------------------------------
+    # 产物分发（收回来之后再推给别的节点）
+    # ------------------------------------------------------------------
+    def push(self, job, src_node, src_root, outcome):
+        """把这条作业改过的文件同步到 ``job.sync`` 指定的节点/root。
+
+        回收是"从节点到控制面"，分发是"从控制面到节点"。两边的传输层是同一套：
+        目标节点出签名表（它是接收方），控制面出差分，目标节点 ``patch``。
+        所以"改一个 10MB 文件里的 200 字节"，推给第二台机器传的也是那 200 字节。
+
+        **分发失败不影响作业成败。** 改动已经在源节点上落地了，把作业判失败
+        只会让人工重跑一遍、把同一份改动做两次 —— 那正是租约机制拼命在防的事。
+        失败写进结果里，用 ``mesh sync <作业>`` 重推。
+        """
+        report = {"node": src_node, "root": src_root, "targets": [],
+                  "files": 0, "sent": 0, "size": 0, "saved": 0, "ratio": 0.0,
+                  "errors": [], "ok": True}
+        targets = []
+        for spec in (job.sync or []):
+            try:
+                targets.append(task.SyncTarget.from_any(spec))
+            except task.PlanError as exc:
+                report["errors"].append("分发目标不合法：%s" % exc)
+        if not targets:
+            report["ok"] = not report["errors"]
+            return report
+        if not src_root:
+            report["errors"].append("作业没指定 root，无法判断产物落在哪")
+            report["ok"] = False
+            return report
+
+        changed = sorted({str(p) for p in (outcome.get("changed") or [])})
+        deleted = sorted({str(p) for p in (outcome.get("deleted") or [])})
+        for target in targets:
+            entry = self._push_to(src_node, src_root, target, changed, deleted)
+            report["targets"].append(entry)
+            report["files"] += len(entry["files"])
+            report["sent"] += entry["sent"]
+            report["size"] += entry["size"]
+            report["errors"].extend("%s：%s" % (entry["to"], err)
+                                    for err in entry["errors"])
+
+        report["saved"] = max(0, report["size"] - report["sent"])
+        report["ratio"] = (round(1.0 - report["sent"] / float(report["size"]), 4)
+                           if report["size"] else 0.0)
+        report["ok"] = not report["errors"]
+        return report
+
+    def _push_to(self, src_node, src_root, target, changed, deleted):
+        """推给一个目标 root。返回这个目标的明细（失败也只记在自己头上）。"""
+        entry = {"to": str(target), "node": target.node, "root": target.root,
+                 "paths": list(target.paths), "files": [], "sent": 0, "size": 0,
+                 "errors": [], "ok": True, "skipped": ""}
+
+        if target.node == src_node and target.root == src_root:
+            # 自己推给自己没有意义，但也别报错 —— 计划里写全量的时候很常见
+            entry["skipped"] = "源和目标同一个 root"
+            return entry
+
+        try:
+            client = self.client_for(target.node)
+        except HubError as exc:
+            entry["errors"].append(str(exc))
+            entry["ok"] = False
+            return entry
+
+        for raw in changed:
+            try:
+                rel = _rel_safe(raw)
+            except HubError as exc:
+                entry["errors"].append(str(exc))
+                continue
+            if not target.accepts(rel):
+                continue
+            source = _PushSource(self, src_node, src_root, rel)
+            try:
+                item = self._push_file(source, target, client)
+            except (wire.WireError, delta.DeltaError, OSError, HubError) as exc:
+                entry["errors"].append("%s：%s" % (rel, exc))
+                continue
+            entry["files"].append(item)
+            entry["sent"] += item["sent"]
+            entry["size"] += item["size"]
+
+        for raw in deleted:
+            try:
+                rel = _rel_safe(raw)
+                if not target.accepts(rel):
+                    continue
+                res = client.rm("mesh://%s/%s/%s" % (target.node, target.root, rel))
+            except (wire.WireError, OSError, HubError) as exc:
+                entry["errors"].append("%s：%s" % (raw, exc))
+                continue
+            entry["files"].append({"path": rel, "mode":
+                                   "delete" if (res or {}).get("removed") else "absent",
+                                   "sent": 0, "size": 0})
+
+        entry["ok"] = not entry["errors"]
+        return entry
+
+    def _push_file(self, source, target, client):
+        """一个文件推到目标节点：目标上有旧版就走差分，没有就整取。
+
+        目标节点"已经是这一版"时直接跳过 —— 重推、多目标、幂等重放都会撞上
+        这种情况，每次真的走一遍差分纯属浪费。
+        """
+        tgt_addr = "mesh://%s/%s/%s" % (target.node, target.root, source.rel)
+        src_sha, src_size = source.sha_size()
+        if src_size > MAX_PUSH_BYTES:
+            raise HubError("文件 %d 字节超过单文件分发上限 %d 字节"
+                           % (src_size, MAX_PUSH_BYTES))
+
+        st = client.stat(tgt_addr, sha=True)
+        if st.get("exists") and src_sha and str(st.get("sha") or "") == src_sha:
+            return {"path": source.rel, "mode": "same", "sent": 0, "size": src_size}
+
+        old_size = int(st.get("size") or 0) if st.get("exists") else 0
+        if old_size > 0 and src_size:
+            # 签名表由接收方（目标节点）出 —— 它手上才有旧版本
+            block = _block_for(old_size)
+            sigr = client.sig(tgt_addr, block) or {}
+            sig = sigr.get("sig") or []
+            old_sha = str(sigr.get("old_sha") or "")
+            if sig:
+                up = len(json.dumps(sig).encode("utf-8"))
+                packed = source.delta(sig, block, old_sha)
+                down = len(json.dumps(packed).encode("utf-8"))
+                new_size = int((packed or {}).get("new_size") or 0) or src_size
+                if up + down < new_size:
+                    client.apply_delta(tgt_addr, old_sha, block, packed)
+                    return {"path": source.rel, "mode": "delta",
+                            "sent": up + down, "size": new_size,
+                            "sent_up": up, "sent_down": down}
+
+        data = source.read()
+        if src_size and len(data) != src_size:
+            raise HubError("源文件在读的过程中变了（%d → %d 字节）"
+                           % (src_size, len(data)))
+        res = client.write(tgt_addr, data)
+        return {"path": source.rel, "mode": "full", "sent": len(data),
+                "size": len(data), "sent_up": 0, "sent_down": len(data),
+                "sha": (res or {}).get("sha", "")}
+
+    def sync_job(self, job_id, targets=None):
+        """重推一条**已完成**作业的产物（当时目标离线、或者想再发一遍）。
+
+        源就是上次收产物时记下的节点/root；镜像在就直接用镜像，不在就回源节点要。
+        """
+        job = self.queue.get(job_id)
+        if job is None:
+            raise HubError("队列里没有作业 %s" % job_id)
+        if job.state != queue_mod.DONE:
+            raise HubError("作业 %s 是 %s 状态，只有 done 的作业才有产物可分"
+                           % (job_id, job.state))
+        result = dict(job.result or {})
+        src_node, src_root = result.get("node") or "", result.get("root") or ""
+        if not src_node or not src_root:
+            raise HubError("作业 %s 的结果里没记下源节点/root"
+                           "（0.3 之前跑的作业没有，重新跑一次才有）" % job_id)
+        if targets:
+            job.sync = [task.SyncTarget.from_any(t).to_dict() for t in targets]
+        if not job.sync:
+            raise HubError("作业 %s 没有分发目标（计划里加 sync）" % job_id)
+
+        report = self.push(job, src_node, src_root,
+                           {"changed": result.get("changed") or [],
+                            "deleted": result.get("deleted") or []})
+        result["sync"] = report
+        self.queue.update_result(job_id, result)
+        return report
+
 
     def _pick_node(self, req, now, busy):
         """挑一个本轮还有余量的节点。返回 ``(cap, None)`` 或 ``(None, 原因列表)``。"""

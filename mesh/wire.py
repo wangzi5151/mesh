@@ -44,9 +44,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 __all__ = ["WireError", "Client", "Server", "b64e", "b64d", "NAME", "PROTO"]
 
 NAME = "mesh"
-PROTO = 1
+PROTO = 2                    # 0.3 加了 rm（分发时同步删除）
 DEFAULT_TIMEOUT = 30.0
 MAX_BODY = 64 << 20          # 单请求体上限 64MB
+READ_BLOCK = 8 << 20         # 单次 read 分块（与节点 agent.MAX_READ 对齐）
 
 
 class WireError(Exception):
@@ -149,19 +150,47 @@ class Client(object):
     def ls(self, addr, limit=1000):
         return self.call("ls", {"addr": addr, "limit": limit})
 
-    def stat(self, addr):
-        return self.call("stat", {"addr": addr})
+    def stat(self, addr, sha=False):
+        payload = {"addr": addr}
+        if sha:
+            # 分发前先用它判断"目标上已经是这一版了"，省掉一整轮差分
+            payload["sha"] = True
+        return self.call("stat", payload)
 
     def read(self, addr, offset=0, limit=None):
         r = self.call("read", {"addr": addr, "offset": offset,
                                "limit": limit if limit is not None else -1})
         return b64d(r.get("data") or "")
 
+    def read_all(self, addr, chunk=READ_BLOCK):
+        """把整个文件读完。
+
+        单次 ``read`` 被节点截在 ``MAX_READ``（8MB）—— 直接 ``read()`` 一个
+        20MB 的文件会拿到**悄悄地少了一半**的数据，镜像和分发都会因此写坏。
+        这里按块循环，并且核对总长度。
+        """
+        r = self.call("read", {"addr": addr, "offset": 0, "limit": chunk})
+        out = bytearray(b64d(r.get("data") or ""))
+        total = int(r.get("total") or 0)
+        while len(out) < total:
+            r = self.call("read", {"addr": addr, "offset": len(out), "limit": chunk})
+            piece = b64d(r.get("data") or "")
+            if not piece:
+                break
+            out += piece
+        if total and len(out) != total:
+            raise WireError("读取 %s 不完整：拿到 %d 字节，文件有 %d 字节"
+                            % (addr, len(out), total), kind="protocol")
+        return bytes(out)
+
     def write(self, addr, data, expected_sha=None):
         payload = {"addr": addr, "data": b64e(data)}
         if expected_sha:
             payload["expected_sha"] = expected_sha
         return self.call("write", payload)
+
+    def rm(self, addr, scope=None):
+        return self.call("rm", {"addr": addr, "scope": scope or []})
 
     def sig(self, addr, block_size):
         return self.call("sig", {"addr": addr, "block_size": block_size})
