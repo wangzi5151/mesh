@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mesh"
-version = "0.1.0"
-description = "个人 AI 网格操作系统：把文件系统、能力、算力统一到一张网里（零第三方依赖）"
+version = "0.2.0"
+description = "个人 AI 网格：把文件、能力、算力统一到一张网里（零第三方依赖，支持 TLS 与多租户）"
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }

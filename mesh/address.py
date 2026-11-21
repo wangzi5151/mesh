@@ -36,7 +36,10 @@ SCHEME = "mesh://"
 LOCAL_NODE = "local"
 WILDCARD_NODE = "*"
 
-_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+# 名字会出现在 mesh:// 地址、镜像目录名和库里。允许 Unicode 词字符 ——
+# 中文节点名（"手机"、"笔记本"）是最自然的用法，把它们挡在外面纯属自找麻烦。
+# 前半段限制仍然有效：不能以 . 或 - 开头，不能含 / : 这些会破坏地址结构的字符。
+_NAME_RE = re.compile(r"^[\w][\w.-]{0,63}$", re.UNICODE)
 MAX_PATH = 4096
 
 
@@ -45,7 +48,7 @@ class AddressError(Exception):
 
 
 def is_valid_name(value):
-    """节点/环境/根的名字：字母数字开头，可含 ``._-``，最长 64。"""
+    """节点/环境/根的名字：词字符开头，可含 ``._-``，最长 64（支持中文）。"""
     return bool(value) and bool(_NAME_RE.match(value))
 
 
@@ -54,7 +57,8 @@ def _check_name(value, what):
         return value
     if not is_valid_name(value):
         raise AddressError(
-            "%s名不合法：%r（需字母或数字开头，可含 . _ -，最长 64 字符）" % (what, value))
+            "%s名不合法：%r（需字母、数字或汉字开头，可含 . _ -，最长 64 字符）"
+            % (what, value))
     return value
 
 

@@ -21,6 +21,7 @@ import os
 import platform
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 
@@ -29,6 +30,8 @@ from . import address, capability, delta, queue, task, wire
 __all__ = ["AgentError", "Node", "jail", "serve"]
 
 MAX_READ = 8 << 20          # 单次 read 上限 8MB
+DEFAULT_BACKUP_FILES = 20000        # 回滚备份的文件数上限
+DEFAULT_BACKUP_BYTES = 64 << 20     # 回滚备份的字节上限（超出就只检测不备份）
 MAX_SIG_BLOCKS = 200000     # 签名表最大块数（防内存爆）
 MAX_EXEC_OUT = 1 << 18      # 命令输出截断到 256KB
 READ_CHUNK = 1 << 20
@@ -84,7 +87,13 @@ class Node(object):
     def __init__(self, node_id, roots=None, token="", name=None, tags=None,
                  slots_total=1, agents=None, models=None, tool_names=None,
                  exec_enabled=False, exec_allow_shell=False, probe_versions=False,
-                 runner=None):
+                 runner=None, rollback=True,
+                 backup_max_files=DEFAULT_BACKUP_FILES,
+                 backup_max_bytes=DEFAULT_BACKUP_BYTES):
+        if not address.is_valid_name(node_id):
+            raise AgentError(
+                "节点名不合法：%r（需字母、数字或汉字开头，可含 . _ -，最长 64 字符）"
+                % (node_id,))
         self.node_id = node_id
         self.token = token
         self.name = name or platform.node() or node_id
@@ -98,6 +107,11 @@ class Node(object):
         self.exec_allow_shell = bool(exec_allow_shell)
         self.probe_versions = bool(probe_versions)
         self.runner = runner
+        # 回滚：作业跑之前把 root 里的文件备份一份，越界就整体还原。
+        # 越界写检测是事后的 —— 不备份就只能报警，不能撤销。
+        self.rollback = bool(rollback)
+        self.backup_max_files = int(backup_max_files)
+        self.backup_max_bytes = int(backup_max_bytes)
 
         self.roots = {}
         self._cap = None
@@ -391,6 +405,18 @@ class Node(object):
         raise AgentError("作业未指定 root，而本节点有多个 root：%s"
                          % ", ".join(sorted(self.roots)))
 
+    def _dirs(self, job):
+        """root 内所有子目录（相对路径），回滚时用来清理作业新建的空目录。"""
+        root_name = self._job_root_name(job)
+        base = self.roots[root_name]["path"]
+        out = set()
+        for dirpath, dirnames, _filenames in os.walk(base):
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+            rel = os.path.relpath(dirpath, base).replace(os.sep, "/")
+            if rel != ".":
+                out.add(rel)
+        return out
+
     def _snapshot(self, job, max_files=20000):
         """root 内每个文件的 ``(mtime_ns, size)`` —— 作业前后的比对基线。
 
@@ -417,7 +443,7 @@ class Node(object):
         return snap
 
     def _changed_since(self, job, baseline, max_files=20000):
-        """相对 ``baseline`` 快照被新增或改动过的文件（相对 root 路径）。
+        """相对 ``baseline`` 快照被新增/改动/删除的文件。返回 ``(changed, deleted)``。
 
         注意：**扫整个 root**，不是只扫写作用域目录。否则 agent 写到作用域之外
         的文件根本不会被发现 —— 那样作用域校验就形同虚设。
@@ -427,22 +453,25 @@ class Node(object):
         base = self.roots[root_name]["path"]
 
         changed = []
+        alive = set()
         seen = 0
         for dirpath, dirnames, filenames in os.walk(base):
             dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
             for name in filenames:
                 seen += 1
                 if seen > max_files:
-                    return sorted(changed)
+                    return sorted(changed), sorted(set(baseline) - alive)
                 full = os.path.join(dirpath, name)
                 try:
                     st = os.stat(full)
                 except OSError:
                     continue
                 rel = os.path.relpath(full, base).replace(os.sep, "/")
+                alive.add(rel)
                 if baseline.get(rel) != (st.st_mtime_ns, st.st_size):
                     changed.append(rel)
-        return sorted(changed)
+        # 删掉的文件也算改动 —— 不然越界删除就成了隐形操作
+        return sorted(changed), sorted(set(baseline) - alive)
 
     def _run_cmd(self, job, timeout=1800.0):
         """跑 ``job.cmd``。
@@ -475,12 +504,101 @@ class Node(object):
             "stderr": proc.stderr[:MAX_EXEC_OUT].decode("utf-8", "replace"),
         }
 
+    # ------------------------------------------------------------------
+    # 回滚
+    # ------------------------------------------------------------------
+    def _backup(self, job, files, dirs):
+        """把 root 里的文件备份到临时目录。返回 ``(备份, 跳过原因)``。
+
+        只备份自己声明的 root 之内、跳过 .git 之类的目录。超出条数/字节上限
+        就不备份 —— 宁可明确说"这次只检测不撤销"，也不要为了备份把机器拖死。
+        """
+        if not self.rollback:
+            return None, "未开启回滚（--no-rollback）"
+        total = sum(size for _mtime, size in files.values())
+        if len(files) > self.backup_max_files:
+            return None, ("文件太多（%d > %d），只检测不备份"
+                          % (len(files), self.backup_max_files))
+        if total > self.backup_max_bytes:
+            return None, ("备份体积太大（%d > %d 字节），只检测不备份"
+                          % (total, self.backup_max_bytes))
+
+        root_name = self._job_root_name(job)
+        base = self.roots[root_name]["path"]
+        store = tempfile.mkdtemp(prefix="mesh-backup-")
+        try:
+            for rel in files:
+                src = os.path.join(base, *rel.split("/"))
+                dst = os.path.join(store, "files", *rel.split("/"))
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copy2(src, dst)      # copy2 保留 mtime，还原后才能跟基线对上
+        except OSError:
+            shutil.rmtree(store, ignore_errors=True)
+            raise
+        return {"dir": store, "files": set(files), "dirs": set(dirs)}, ""
+
+    @staticmethod
+    def _drop_backup(backup):
+        if backup:
+            shutil.rmtree(backup["dir"], ignore_errors=True)
+
+    def _restore(self, job, backup, changed, deleted):
+        """把越界的改动抹掉：改动过的还原，新建的删掉，删掉的写回去。"""
+        root_name = self._job_root_name(job)
+        base = self.roots[root_name]["path"]
+        store = os.path.join(backup["dir"], "files")
+        restored, removed, failed = [], [], []
+
+        def put_back(rel):
+            src = os.path.join(store, *rel.split("/"))
+            dst = os.path.join(base, *rel.split("/"))
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(src, dst)
+
+        for rel in list(changed) + list(deleted):
+            had_backup = rel in backup["files"]
+            try:
+                if had_backup:
+                    put_back(rel)
+                    restored.append(rel)
+                else:
+                    dst = os.path.join(base, *rel.split("/"))
+                    if os.path.isfile(dst):
+                        os.remove(dst)          # 作业新建的文件
+                        removed.append(rel)
+            except OSError as exc:
+                failed.append("%s：%s" % (rel, exc))
+
+        # 作业新建的空目录也清掉
+        pruned = []
+        try:
+            current = self._dirs(job)
+            for rel in sorted(current - backup["dirs"], key=len, reverse=True):
+                path = os.path.join(base, *rel.split("/"))
+                try:
+                    os.rmdir(path)              # 非空会抛，正好跳过
+                    pruned.append(rel)
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+        return {"restored": restored, "removed": removed,
+                "deleted_back": [r for r in deleted if r in backup["files"]],
+                "pruned_dirs": pruned, "failed": failed}
+
     def op_job(self, payload):
-        """跑一条作业，并在落盘后强制校验写作用域。"""
+        """跑一条作业，落盘后强制校验写作用域，越界就回滚。"""
         job = queue.Job.from_dict(payload.get("job") or {})
         if not self.acquire_slot():
             raise AgentError("槽位已满（%d/%d）" % (self.slots_used, self.slots_total))
         baseline = self._snapshot(job)
+        backup, skip_reason = None, ""
+        try:
+            backup, skip_reason = self._backup(job, baseline, self._dirs(job))
+        except OSError as exc:
+            skip_reason = "备份失败：%s" % exc
+
         try:
             if self.runner is not None:
                 out = self.runner(job) or {}
@@ -488,12 +606,16 @@ class Node(object):
                 out = self._run_cmd(job, timeout=float(payload.get("timeout") or 1800))
             else:
                 raise AgentError("作业既没有 cmd，节点也没有配置 runner")
+            if not isinstance(out, dict):
+                raise AgentError("runner 必须返回字典（收到 %s）" % type(out).__name__)
 
-            changed = self._changed_since(job, baseline)
-            violations = task.check_scope(job, changed)
+            changed, deleted = self._changed_since(job, baseline)
+            # 删掉作用域外的文件同样是越界，别只盯写入
+            violations = task.check_scope(job, list(changed) + list(deleted))
 
             out = dict(out)
             out["changed"] = changed
+            out["deleted"] = deleted
             out["violations"] = violations
             # runner 自己报的 ok 优先：自定义执行器完全可以不用 rc 表达失败
             # （比如大模型回复"这题我做不了"），一律按 rc==0 判成功会把
@@ -502,19 +624,35 @@ class Node(object):
             if verdict is None:
                 verdict = out.get("rc", 0) == 0
             out["ok"] = bool(verdict) and not violations
+
             if violations:
-                out["error"] = ("越界写入 %d 个文件（作用域 %s）：%s"
-                                "（已写出的文件不会自动回滚）"
-                                % (len(violations), job.write, ", ".join(violations[:10])))
+                rollback = {"restored": [], "removed": [], "failed": [],
+                            "skipped": skip_reason}
+                if backup is not None:
+                    rollback = self._restore(job, backup, changed, deleted)
+                    # 复核一遍：还原之后理论上应该回到基线
+                    after_changed, after_deleted = self._changed_since(job, baseline)
+                    rollback["clean"] = not after_changed and not after_deleted
+                    rollback["skipped"] = ""
+                    if not rollback["clean"]:
+                        rollback["leftover"] = after_changed + after_deleted
+                out["rollback"] = rollback
+                out["error"] = ("越界改动 %d 个文件（作用域 %s）：%s%s"
+                                % (len(violations), job.write,
+                                   ", ".join(violations[:10]),
+                                   ("；已回滚" if rollback.get("clean")
+                                    else "；未能完全回滚")))
             return out
         finally:
+            self._drop_backup(backup)
             self.release_slot()
 
     # ------------------------------------------------------------------
     # 服务装配
     # ------------------------------------------------------------------
-    def build_server(self, host="127.0.0.1", port=0):
-        srv = wire.Server(host=host, port=port, token=self.token, node_id=self.node_id)
+    def build_server(self, host="127.0.0.1", port=0, tls=None):
+        srv = wire.Server(host=host, port=port, token=self.token,
+                          node_id=self.node_id, tls=tls)
         srv.add("cap", lambda payload: self.capability().to_dict())
         srv.add("ls", self.op_ls)
         srv.add("stat", self.op_stat)
@@ -533,8 +671,8 @@ class Node(object):
             self.slots_used, self.slots_total)
 
 
-def serve(node, host="127.0.0.1", port=8765):
+def serve(node, host="127.0.0.1", port=8765, tls=None):
     """起一个节点服务并阻塞。返回 Server（已启动）。"""
-    srv = node.build_server(host=host, port=port)
+    srv = node.build_server(host=host, port=port, tls=tls)
     srv.start()
     return srv

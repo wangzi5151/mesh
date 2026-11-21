@@ -339,5 +339,137 @@ class TestJobModel(unittest.TestCase):
         self.assertEqual(j.req, {})
 
 
+# --------------------------------------------------------------------------
+# 调度权（多控制面）
+# --------------------------------------------------------------------------
+class TestLock(Base):
+    def test_first_holder_wins(self):
+        self.assertTrue(self.q.acquire_lock("sched", "hub-a", ttl=10, now=1000))
+        self.assertFalse(self.q.acquire_lock("sched", "hub-b", ttl=10, now=1000.5))
+        self.assertEqual(self.q.lock_holder("sched", now=1001), "hub-a")
+
+    def test_holder_can_retake(self):
+        self.assertTrue(self.q.acquire_lock("sched", "hub-a", ttl=10, now=1000))
+        self.assertTrue(self.q.acquire_lock("sched", "hub-a", ttl=10, now=1005))
+
+    def test_expired_lock_can_be_taken(self):
+        self.q.acquire_lock("sched", "hub-a", ttl=10, now=1000)
+        self.assertTrue(self.q.acquire_lock("sched", "hub-b", ttl=10, now=1011))
+        self.assertEqual(self.q.lock_holder("sched", now=1012), "hub-b")
+
+    def test_renew_only_by_holder(self):
+        self.q.acquire_lock("sched", "hub-a", ttl=1, now=1000)
+        self.assertTrue(self.q.renew_lock("sched", "hub-a", ttl=10, now=1000.5))
+        self.assertFalse(self.q.renew_lock("sched", "hub-b", ttl=10, now=1000.5))
+
+    def test_release(self):
+        self.q.acquire_lock("sched", "hub-a", ttl=10, now=1000)
+        self.assertFalse(self.q.release_lock("sched", "hub-b"))
+        self.assertTrue(self.q.release_lock("sched", "hub-a"))
+        self.assertFalse(self.q.release_lock("sched", "hub-a"))
+
+    def test_no_holder(self):
+        self.assertEqual(self.q.lock_holder("sched"), "")
+
+    def test_two_connections_see_the_same_lock(self):
+        other = Q.Queue(self.path)
+        try:
+            self.assertTrue(self.q.acquire_lock("sched", "hub-a", ttl=10))
+            self.assertFalse(other.acquire_lock("sched", "hub-b", ttl=10))
+        finally:
+            other.close()
+
+
+# --------------------------------------------------------------------------
+# 节点清单
+# --------------------------------------------------------------------------
+class TestNodeStore(Base):
+    def test_save_and_load(self):
+        self.q.save_node("n1", "http://h:1", "tok", ["gpu"], 2.0)
+        self.q.save_node("n2", "http://h:2")
+        rows = self.q.load_nodes()
+        self.assertEqual([r["node_id"] for r in rows], ["n1", "n2"])
+        self.assertEqual(rows[0]["tags"], ["gpu"])
+        self.assertEqual(rows[0]["weight"], 2.0)
+        self.assertEqual(rows[0]["token"], "tok")
+
+    def test_upsert(self):
+        self.q.save_node("n1", "http://old", "t1")
+        self.q.save_node("n1", "http://new", "t2", ["x"], 3.0)
+        rows = self.q.load_nodes()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["url"], "http://new")
+        self.assertEqual(rows[0]["tags"], ["x"])
+
+    def test_delete(self):
+        self.q.save_node("n1", "http://h:1")
+        self.assertTrue(self.q.delete_node("n1"))
+        self.assertFalse(self.q.delete_node("n1"))
+        self.assertEqual(self.q.load_nodes(), [])
+
+    def test_clear(self):
+        self.q.save_node("n1", "http://h:1")
+        self.q.save_node("n2", "http://h:2")
+        self.assertEqual(self.q.clear_nodes(), 2)
+        self.assertEqual(self.q.load_nodes(), [])
+
+    def test_survives_reopen(self):
+        self.q.save_node("n1", "http://h:1", "tok", ["a"])
+        other = Q.Queue(self.path)
+        try:
+            self.assertEqual(other.load_nodes()[0]["node_id"], "n1")
+        finally:
+            other.close()
+
+
+# --------------------------------------------------------------------------
+# 令牌
+# --------------------------------------------------------------------------
+class TestTokenStore(Base):
+    def test_add_and_load(self):
+        digest = self.q.add_token("secret", ["read", "submit"], "blog", "博客")
+        rows = self.q.load_tokens()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["token_hash"], digest)
+        self.assertEqual(rows[0]["label"], "博客")
+        self.assertEqual(rows[0]["project"], "blog")
+        self.assertEqual(sorted(rows[0]["perms"]), ["read", "submit"])
+
+    def test_plaintext_not_in_db_file(self):
+        self.q.add_token("非常明显的口令", ["read"], "", "x")
+        with open(self.path, "rb") as f:
+            raw = f.read()
+        self.assertNotIn("非常明显的口令".encode("utf-8"), raw)
+
+    def test_db_file_is_owner_only(self):
+        mode = os.stat(self.path).st_mode & 0o777
+        self.assertEqual(mode, 0o600)
+
+    def test_upsert_same_token(self):
+        self.q.add_token("secret", ["read"], "", "旧")
+        self.q.add_token("secret", ["admin"], "p", "新")
+        rows = self.q.load_tokens()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["label"], "新")
+        self.assertEqual(rows[0]["perms"], ["admin"])
+
+    def test_delete_by_label(self):
+        self.q.add_token("a", ["read"], "", "甲")
+        self.q.add_token("b", ["read"], "", "乙")
+        self.assertTrue(self.q.delete_token(label="甲"))
+        self.assertFalse(self.q.delete_token(label="甲"))
+        self.assertEqual([r["label"] for r in self.q.load_tokens()], ["乙"])
+
+    def test_delete_by_hash(self):
+        self.q.add_token("a", ["read"], "", "甲")
+        digest = self.q.load_tokens()[0]["token_hash"]
+        self.assertTrue(self.q.delete_token(token_hash=digest))
+        self.assertEqual(self.q.load_tokens(), [])
+
+    def test_delete_needs_a_key(self):
+        with self.assertRaises(Q.QueueError):
+            self.q.delete_token()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

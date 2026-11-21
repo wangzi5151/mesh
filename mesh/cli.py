@@ -24,7 +24,8 @@ import time
 import unicodedata
 
 from . import __version__
-from . import agent, capability, hub as hub_mod, queue as queue_mod, task, wire
+from . import agent, auth as auth_mod, capability, hub as hub_mod
+from . import queue as queue_mod, task, wire
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -203,14 +204,25 @@ def build_node(args):
             agents=split_list(args.agents) or None,
             tool_names=split_list(args.tools) or None,
             exec_enabled=bool(args.exec), exec_allow_shell=bool(args.exec),
+            rollback=not args.no_rollback,
+            backup_max_bytes=int(args.backup_max_mb * (1 << 20)),
         )
     except agent.AgentError as exc:
         raise CliError(str(exc))
 
 
+def _tls_from(args):
+    """--tls-cert/--tls-key 要么都给，要么都不给。"""
+    cert, key = getattr(args, "tls_cert", None), getattr(args, "tls_key", None)
+    if bool(cert) != bool(key):
+        raise CliError("--tls-cert 和 --tls-key 必须成对给")
+    return (cert, key) if cert else None
+
+
 def cmd_node(args):
     node = build_node(args)
-    srv = node.build_server(host=args.bind, port=args.port)
+    tls = _tls_from(args)
+    srv = node.build_server(host=args.bind, port=args.port, tls=tls)
     srv.start()
     cap = node.capability()
     _out("节点 %s 已上线：%s" % (node.node_id, srv.url))
@@ -219,6 +231,8 @@ def cmd_node(args):
     _out("  CPU     %d 核，负载 %s" % (cap.cpu_count, cap.loadavg or "-"))
     _out("  槽位    %d" % cap.slots_total)
     _out("  终端    %s" % ("已开启" if cap.exec_enabled else "未开启（--exec 打开）"))
+    _out("  回滚    %s" % ("开启（越界改动会被还原）" if node.rollback else "关闭"))
+    _out("  链路    %s" % ("HTTPS" if tls else "HTTP（内网明文）"))
     _out("  令牌    %s" % ("已启用" if args.token else "无 —— 同网段谁能连谁能读"))
     for entry in node.roots_info():
         _out("  root    %-10s %-6s %s" % (entry["name"], entry["mode"], entry["path"]))
@@ -236,10 +250,18 @@ def cmd_node(args):
 def cmd_hub(args):
     if args.interval <= 0:
         raise CliError("--interval 必须大于 0")
+    tls = _tls_from(args)
     hub = hub_mod.Hub(
-        args.db, token=args.token or "", poll=args.interval,
-        ttl=args.ttl, dispatch_timeout=args.dispatch_timeout, lease=args.lease)
+        args.db, token=args.token or "", poll=args.interval, ttl=args.ttl,
+        dispatch_timeout=args.dispatch_timeout, lease=args.lease,
+        mirror=args.mirror, ca=args.tls_ca, tls_insecure=args.tls_insecure)
+    # 令牌从库里读；--token 额外算一把管理员口令
+    hub.auth = auth_mod.Auth.from_store(
+        hub.queue, admin_tokens=[args.token] if args.token else [])
     try:
+        restored = hub.nodes()
+        if restored:
+            _out("从库里恢复 %d 个节点" % len(restored))
         for item in (load_nodes(args.nodes_file) if args.nodes_file else []):
             hub.add_node(item["node_id"], item["url"], item["token"],
                          item["tags"], item["weight"])
@@ -251,9 +273,14 @@ def cmd_hub(args):
             hub.add_node(node_id.strip(), url.strip(), args.node_token or "")
             _out("接入节点 %s → %s" % (node_id.strip(), url.strip()))
 
+        if args.mirror:
+            _out("产物镜像：%s" % hub.mirror)
+        if not hub.auth.enabled:
+            _out("提示：没有配置任何令牌，控制面对同网段完全开放（mesh token add 可以加）")
+
         srv = None
         if args.port is not None:
-            srv = hub.build_server(host=args.bind, port=args.port)
+            srv = hub.build_server(host=args.bind, port=args.port, tls=tls)
             srv.start()
             _out("控制面面板：%s/" % srv.url)
             if args.token:
@@ -290,9 +317,22 @@ def _run_loop(hub, interval):
 
     _out("按 Ctrl-C 停止")
     prev = None
+    standby_seen = ""
     try:
         while not stop.is_set():
             report = hub.tick()
+            holder = report.get("standby")
+            if holder:
+                # 待命也要说出来：不然跑第二个控制面的人以为它坏了
+                if holder != standby_seen:
+                    _out("[%s] 待命：调度权在 %s 手上"
+                         % (time.strftime("%H:%M:%S"), holder))
+                    standby_seen = holder
+                stop.wait(interval)
+                continue
+            if standby_seen:
+                _out("[%s] 接手调度" % time.strftime("%H:%M:%S"))
+                standby_seen = ""
             line, prev = _summary_line(report, prev)
             if line:
                 _out(line)
@@ -410,7 +450,9 @@ def cmd_status(args):
 
 def _status_from_hub(args):
     """问一个在跑的 hub 要状态（能看到节点在线情况，队列文件看不到）。"""
-    client = wire.Client(args.hub_url, args.hub_token or "")
+    client = wire.Client(args.hub_url, args.hub_token or "",
+                         ca=getattr(args, "tls_ca", None),
+                         insecure=getattr(args, "tls_insecure", False))
     try:
         result = client.call("status")
         jobs = client.call("jobs", {"limit": args.limit})
@@ -431,11 +473,19 @@ def _status_from_hub(args):
     else:
         _out("  （还没有节点接入）")
 
+    bits = ["调度权 %s" % ("在派发" if result.get("leader") else "待命（别人在派）")]
+    if result.get("mirror"):
+        bits.append("产物镜像 %s" % result["mirror"])
+    auth_info = result.get("auth") or {}
+    bits.append("鉴权 %s" % ("已开（%d 把令牌）" % (auth_info.get("grants", 0))
+                            if auth_info.get("enabled") else "未配置（同网段开放）"))
+    _out("")
+    _out("  ".join(bits))
+
     stats = result["jobs"]
     order = [queue_mod.QUEUED, queue_mod.RUNNING, queue_mod.DONE,
              queue_mod.FAILED, queue_mod.BLOCKED, queue_mod.CANCELED]
     parts = ["%s %d" % (s, stats[s]) for s in order if stats.get(s)]
-    _out("")
     _out("作业 %s" % ("，".join(parts) if parts else "空"))
     if jobs:
         _out("")
@@ -496,6 +546,93 @@ def cmd_cancel(args):
             _out("已取消 %s" % job_id)
     finally:
         queue.close()
+    return EXIT_OK
+
+
+# --------------------------------------------------------------------------
+# mesh nodes / mesh token（直接改库，不需要 hub 在跑）
+# --------------------------------------------------------------------------
+def cmd_nodes(args):
+    if args.action == "ls":
+        queue = open_queue(args)
+        try:
+            rows = queue.load_nodes()
+        finally:
+            queue.close()
+        if args.json:
+            _out(json.dumps(rows, ensure_ascii=False, indent=2))
+        elif rows:
+            _out(table([[r["node_id"], r["url"], ",".join(r["tags"]) or "-",
+                         r["weight"], "有" if r["token"] else "-"] for r in rows],
+                       ["节点", "地址", "标签", "权重", "令牌"]))
+        else:
+            _out("还没有节点。mesh nodes add <id> <url> 加一个")
+        return EXIT_OK
+
+    if args.node_id is None:
+        raise CliError("要加/删节点就得给 node_id")
+    queue = open_queue(args, create=True)
+    try:
+        if args.action == "add":
+            if not args.url:
+                raise CliError("nodes add 需要地址：mesh nodes add 手机 http://ip:8765")
+            queue.save_node(args.node_id, args.url, args.token or "",
+                            split_list(args.tags), args.weight)
+            _out("已接入 %s → %s" % (args.node_id, args.url))
+        else:
+            if not queue.delete_node(args.node_id):
+                raise CliError("库里没有节点 %s" % args.node_id)
+            _out("已移除 %s" % args.node_id)
+    finally:
+        queue.close()
+    return EXIT_OK
+
+
+def cmd_token(args):
+    if args.action == "ls":
+        queue = open_queue(args)
+        try:
+            rows = queue.load_tokens()
+        finally:
+            queue.close()
+        if args.json:
+            _out(json.dumps(rows, ensure_ascii=False, indent=2))
+        elif rows:
+            _out(table([[r["label"] or "-", r["project"] or "（全部项目）",
+                         ",".join(r["perms"]), r["token_hash"][:12] + "…"] for r in rows],
+                       ["标签", "项目", "权限", "指纹"]))
+        else:
+            _out("还没有令牌 —— 控制面对同网段完全开放")
+        return EXIT_OK
+
+    if args.action == "add":
+        perms = split_list(args.perms) or ["read"]
+        try:
+            auth_mod.normalize(perms)          # 早点炸，别等写进库才发现拼错
+        except ValueError as exc:
+            raise CliError(str(exc))
+        token = auth_mod.new_token()
+        queue = open_queue(args, create=True)
+        try:
+            queue.add_token(token, perms, args.project or "", args.label or "")
+        finally:
+            queue.close()
+        _out("已创建令牌（只显示这一次，记下来）：")
+        _out("")
+        _out("  %s" % token)
+        _out("")
+        _out("  项目  %s" % (args.project or "（全部项目）"))
+        _out("  权限  %s" % ",".join(perms))
+        return EXIT_OK
+
+    queue = open_queue(args)
+    try:
+        ok = queue.delete_token(label=args.label, token_hash=args.hash)
+    finally:
+        queue.close()
+    if not ok:
+        raise CliError("没找到要删的令牌（给 --label 或 --hash）")
+    _out("已删除")
     return EXIT_OK
 
 
@@ -577,12 +714,25 @@ def build_parser():
     p.add_argument("--agents", default="", help="可用 agent 类型，逗号分隔")
     p.add_argument("--tools", default="", help="只探测这些工具，逗号分隔")
     p.add_argument("--exec", action="store_true", help="允许执行命令（需要 --token）")
+    p.add_argument("--no-rollback", action="store_true",
+                   help="不做作业前备份（默认开启：越界改动会被还原）")
+    p.add_argument("--backup-max-mb", type=float, default=64.0,
+                   help="回滚备份的体积上限（MB，默认 64；超出只检测不撤销）")
+    p.add_argument("--tls-cert", metavar="FILE", help="证书（和 --tls-key 成对）")
+    p.add_argument("--tls-key", metavar="FILE", help="私钥")
     p.set_defaults(func=cmd_node)
 
     # -- hub
     p = sub.add_parser("hub", help="起控制面：回收、心跳、派发、收尾")
     p.add_argument("--db", default="mesh.db", help="队列文件（默认 mesh.db）")
-    p.add_argument("--nodes-file", metavar="FILE", help="节点清单 JSON")
+    p.add_argument("--nodes-file", metavar="FILE", help="节点清单 JSON（会写进库里）")
+    p.add_argument("--mirror", metavar="DIR",
+                   help="产物落地目录：作业改过的文件按增量收回来")
+    p.add_argument("--tls-cert", metavar="FILE", help="面板/接口证书（和 --tls-key 成对）")
+    p.add_argument("--tls-key", metavar="FILE", help="面板/接口私钥")
+    p.add_argument("--tls-ca", metavar="FILE", help="连节点时用来校验的 CA")
+    p.add_argument("--tls-insecure", action="store_true",
+                   help="连节点时不校验证书（自签内网先用这个）")
     p.add_argument("--node", action="append", metavar="ID=URL", help="直接给一个节点，可重复")
     p.add_argument("--node-token", default="", help="--node 用的令牌")
     p.add_argument("--port", type=int, default=None,
@@ -619,6 +769,8 @@ def build_parser():
     p.add_argument("--hub", dest="hub_url", default="",
                    help="问一个在跑的控制面（能看节点在线情况）")
     p.add_argument("--hub-token", default="")
+    p.add_argument("--tls-ca", metavar="FILE", help="连控制面时用来校验的 CA")
+    p.add_argument("--tls-insecure", action="store_true", help="不校验控制面证书")
     p.add_argument("--limit", type=int, default=15)
     p.set_defaults(func=cmd_status)
 
@@ -644,6 +796,30 @@ def build_parser():
     p.add_argument("--db", default="mesh.db")
     p.add_argument("--reason", default=None)
     p.set_defaults(func=cmd_cancel)
+
+    # -- nodes
+    p = sub.add_parser("nodes", help="管理节点清单（存在库里，重启不丢）")
+    p.add_argument("action", choices=["ls", "add", "rm"])
+    p.add_argument("node_id", nargs="?", help="节点名")
+    p.add_argument("url", nargs="?", help="http(s)://host:port")
+    p.add_argument("--db", default="mesh.db")
+    p.add_argument("--token", default="", help="节点口令")
+    p.add_argument("--tags", default="", help="标签，逗号分隔")
+    p.add_argument("--weight", type=float, default=1.0)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_nodes)
+
+    # -- token
+    p = sub.add_parser("token", help="管理访问令牌（只存哈希）")
+    p.add_argument("action", choices=["ls", "add", "rm"])
+    p.add_argument("--db", default="mesh.db")
+    p.add_argument("--perms", default="read",
+                   help="权限，逗号分隔：read,submit,cancel,admin")
+    p.add_argument("--project", default="", help="限制到某个项目（默认全部）")
+    p.add_argument("--label", default="", help="备注名，删的时候好用")
+    p.add_argument("--hash", default=None, help="按指纹删")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_token)
 
     # -- doctor
     p = sub.add_parser("doctor", help="体检：本机能不能当节点、队列能不能写")

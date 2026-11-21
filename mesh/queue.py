@@ -35,6 +35,7 @@ Mesh 的控制面必须能：断电重启接着跑、多节点并发安全、历
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -60,6 +61,8 @@ TERMINAL = (DONE, FAILED, CANCELED)
 
 DEFAULT_LEASE = 180.0          # 租约秒数
 DEFAULT_MAX_ATTEMPTS = 2       # agent 最多试几次
+LEADER_LOCK = "scheduler"      # 调度权的锁名
+DEFAULT_LEADER_TTL = 15.0      # 领导权租约（秒）；一个 tick 之内要能续上
 
 
 class QueueError(Exception):
@@ -119,6 +122,33 @@ CREATE TABLE IF NOT EXISTS events (
 
 CREATE INDEX IF NOT EXISTS idx_events_job ON events(job_id, seq);
 CREATE INDEX IF NOT EXISTS idx_events_ts  ON events(ts);
+
+-- 调度权：同一份队列允许多个控制面盯着，但只有一个在派发
+CREATE TABLE IF NOT EXISTS locks (
+    name       TEXT PRIMARY KEY,
+    holder     TEXT NOT NULL,
+    expires    REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+-- 节点清单：控制面重启后不用再喂一遍 --nodes-file
+CREATE TABLE IF NOT EXISTS nodes (
+    node_id   TEXT PRIMARY KEY,
+    url       TEXT NOT NULL,
+    token     TEXT NOT NULL DEFAULT '',
+    tags_json TEXT NOT NULL DEFAULT '[]',
+    weight    REAL NOT NULL DEFAULT 1.0,
+    added_at  REAL NOT NULL
+);
+
+-- 令牌：只存 sha256，明文不落库
+CREATE TABLE IF NOT EXISTS tokens (
+    token_hash TEXT PRIMARY KEY,
+    label      TEXT NOT NULL DEFAULT '',
+    project    TEXT NOT NULL DEFAULT '',
+    perms_json TEXT NOT NULL DEFAULT '[]',
+    created_at REAL NOT NULL
+);
 """
 
 
@@ -258,6 +288,12 @@ class Queue(object):
             self._db.execute("PRAGMA foreign_keys=ON")
             self._db.execute("PRAGMA busy_timeout=30000")
             self._db.executescript(SCHEMA)
+        if self.path != ":memory:":
+            # 令牌和节点口令都在这个文件里 —— 别让同组用户顺手读走
+            try:
+                os.chmod(self.path, 0o600)
+            except OSError:
+                pass
 
     def close(self):
         with self._lock:
@@ -605,6 +641,136 @@ class Queue(object):
                 (reason or "", now, job_id))
             self._db.execute("COMMIT")
         self._event("block", job_id, "", {"reason": reason})
+
+    # ------------------------------------------------------------------
+    # 调度权（多控制面）
+    # ------------------------------------------------------------------
+    def acquire_lock(self, name, holder, ttl=DEFAULT_LEADER_TTL, now=None):
+        """抢一把带租约的锁。抢到（或本来就是我持有）返回 True。
+
+        用这个让"多个控制面盯同一份队列"变安全：只有一个在派发，其余的待命。
+        租约过期（进程被杀、机器断电）后别人自然能接手，不需要手工清理。
+        """
+        now = now or time.time()
+        expires = now + float(ttl)
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._db.execute(
+                    "SELECT holder, expires FROM locks WHERE name=?", (name,)).fetchone()
+                if row is None:
+                    self._db.execute(
+                        "INSERT INTO locks (name, holder, expires, updated_at) VALUES (?,?,?,?)",
+                        (name, holder, expires, now))
+                    ok = True
+                elif row["holder"] == holder or row["expires"] <= now:
+                    self._db.execute(
+                        "UPDATE locks SET holder=?, expires=?, updated_at=? WHERE name=?",
+                        (holder, expires, now, name))
+                    ok = True
+                else:
+                    ok = False
+                self._db.execute("COMMIT")
+            except Exception:
+                self._db.execute("ROLLBACK")
+                raise
+        return ok
+
+    def renew_lock(self, name, holder, ttl=DEFAULT_LEADER_TTL, now=None):
+        """续租。已经不是我持有的（被别人抢走了）返回 False。"""
+        now = now or time.time()
+        with self._lock:
+            cur = self._db.execute(
+                "UPDATE locks SET expires=?, updated_at=? WHERE name=? AND holder=?",
+                (now + float(ttl), now, name, holder))
+            return cur.rowcount > 0
+
+    def release_lock(self, name, holder):
+        with self._lock:
+            cur = self._db.execute(
+                "DELETE FROM locks WHERE name=? AND holder=?", (name, holder))
+            return cur.rowcount > 0
+
+    def lock_holder(self, name, now=None):
+        """谁现在持有锁（空字符串表示没人）。"""
+        now = now if now is not None else time.time()
+        with self._lock:
+            row = self._db.execute(
+                "SELECT holder, expires FROM locks WHERE name=?", (name,)).fetchone()
+        if row is None or row["expires"] <= now:
+            return ""
+        return row["holder"]
+
+    # ------------------------------------------------------------------
+    # 节点清单
+    # ------------------------------------------------------------------
+    def save_node(self, node_id, url, token="", tags=None, weight=1.0):
+        now = time.time()
+        with self._lock:
+            self._db.execute(
+                """INSERT INTO nodes (node_id, url, token, tags_json, weight, added_at)
+                   VALUES (?,?,?,?,?,?)
+                   ON CONFLICT(node_id) DO UPDATE SET
+                       url=excluded.url, token=excluded.token,
+                       tags_json=excluded.tags_json, weight=excluded.weight""",
+                (node_id, url, token or "",
+                 json.dumps(list(tags or []), ensure_ascii=False),
+                 float(weight), now))
+
+    def load_nodes(self):
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT * FROM nodes ORDER BY node_id").fetchall()
+        return [{
+            "node_id": r["node_id"], "url": r["url"], "token": r["token"],
+            "tags": _loads(r["tags_json"], []), "weight": r["weight"],
+        } for r in rows]
+
+    def delete_node(self, node_id):
+        with self._lock:
+            cur = self._db.execute("DELETE FROM nodes WHERE node_id=?", (node_id,))
+            return cur.rowcount > 0
+
+    def clear_nodes(self):
+        with self._lock:
+            cur = self._db.execute("DELETE FROM nodes")
+            return cur.rowcount
+
+    # ------------------------------------------------------------------
+    # 令牌（只存哈希）
+    # ------------------------------------------------------------------
+    def add_token(self, token, perms, project="", label=""):
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        with self._lock:
+            self._db.execute(
+                """INSERT INTO tokens (token_hash, label, project, perms_json, created_at)
+                   VALUES (?,?,?,?,?)
+                   ON CONFLICT(token_hash) DO UPDATE SET
+                       label=excluded.label, project=excluded.project,
+                       perms_json=excluded.perms_json""",
+                (digest, label or "", project or "",
+                 json.dumps(sorted(set(perms or [])), ensure_ascii=False), time.time()))
+        return digest
+
+    def load_tokens(self):
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT * FROM tokens ORDER BY created_at").fetchall()
+        return [{
+            "token_hash": r["token_hash"], "label": r["label"],
+            "project": r["project"], "perms": _loads(r["perms_json"], []),
+        } for r in rows]
+
+    def delete_token(self, label=None, token_hash=None):
+        with self._lock:
+            if token_hash:
+                cur = self._db.execute(
+                    "DELETE FROM tokens WHERE token_hash=?", (token_hash,))
+            elif label:
+                cur = self._db.execute("DELETE FROM tokens WHERE label=?", (label,))
+            else:
+                raise QueueError("要删令牌就得给 label 或 token_hash")
+            return cur.rowcount > 0
 
     # ------------------------------------------------------------------
     # 查询帮助函数

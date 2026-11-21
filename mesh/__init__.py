@@ -18,8 +18,9 @@
 ``task``      任务图：DAG 校验、批次、写作用域
 ``wire``      零依赖 HTTP + JSON-RPC（客户端与服务端）
 ``agent``     节点 agent：路径围栏、只读 root、作用域强制
-``hub``       控制面：心跳、派发、失败重试、面板
-``cli``       命令行：node / hub / submit / status / doctor
+``hub``       控制面：心跳、派发、失败重试、产物回收、面板
+``auth``      令牌与权限：项目隔离、只读/可提交/可管理
+``cli``       命令行：node / hub / submit / nodes / token / status / doctor
 ============  ==========================================================
 
 最省事的起法（两台机器，同一个局域网）::
@@ -27,22 +28,25 @@
     # 手机（Termux + proot）：把工作目录暴露出去
     mesh node --id 手机 --root work=~/proj --token 123 --port 8765
 
-    # 任意一台常开的机器：开始调度，手机浏览器打开面板看全程
-    mesh hub --db mesh.db --node 手机=http://手机IP:8765 \\
-             --node-token 123 --port 8788 --token 123
+    # 任意一台常开的机器：登记节点、发一把只能提交 blog 项目的令牌
+    mesh nodes add 手机 http://手机IP:8765 --token 123 --tags llm --db mesh.db
+    mesh token add --perms submit,read --project blog --db mesh.db
+
+    # 开始调度；手机浏览器打开面板看全程
+    mesh hub --db mesh.db --mirror ./产物 --port 8788 --token 123
 """
 
 from __future__ import annotations
 
-from . import address, agent, capability, delta, hub, queue, task, wire
+from . import address, agent, auth, capability, delta, hub, queue, task, wire
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 PROTO = 1
 NAME = "mesh"
 
 __all__ = [
     "__version__", "PROTO", "NAME",
-    "address", "agent", "capability", "delta", "hub", "queue", "task", "wire",
+    "address", "agent", "auth", "capability", "delta", "hub", "queue", "task", "wire",
     "MeshAddress", "parse", "matches",
     "Capability", "Registry", "probe", "score",
     "Delta", "diff", "patch",
@@ -51,6 +55,7 @@ __all__ = [
     "Node", "serve", "jail",
     "Hub", "HubError", "NodeRef",
     "Client", "Server", "WireError",
+    "Auth", "Grant",
 ]
 
 # 常用名字提到顶层，方便 `from mesh import parse, diff, Hub`
@@ -85,3 +90,6 @@ NodeRef = hub.NodeRef
 Client = wire.Client
 Server = wire.Server
 WireError = wire.WireError
+
+Auth = auth.Auth
+Grant = auth.Grant

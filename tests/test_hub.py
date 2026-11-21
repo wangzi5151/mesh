@@ -675,5 +675,374 @@ class TestServer(HubBase):
         self.assertEqual(ctx.exception.status, 401)
 
 
+# --------------------------------------------------------------------------
+# 节点清单持久化
+# --------------------------------------------------------------------------
+class TestNodePersistence(HubBase):
+    def test_node_survives_restart(self):
+        h = self.hub()
+        h.add_node("n1", "http://h:1", "tok", ["gpu"], 2.0)
+        h.close()
+        self._hubs.remove(h)
+
+        again = self.hub()
+        rows = again.nodes()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["node_id"], "n1")
+        self.assertEqual(rows[0]["url"], "http://h:1")
+        self.assertEqual(rows[0]["tags"], ["gpu"])
+
+    def test_token_survives_restart(self):
+        h = self.hub()
+        h.add_node("n1", "http://h:1", "secret-token")
+        h.close()
+        self._hubs.remove(h)
+        self.assertEqual(self.hub().client_for("n1").token, "secret-token")
+
+    def test_remove_is_persistent(self):
+        h = self.hub()
+        h.add_node("n1", "http://h:1")
+        h.remove_node("n1")
+        h.close()
+        self._hubs.remove(h)
+        self.assertEqual(self.hub().nodes(), [])
+
+    def test_persist_false(self):
+        h = self.hub()
+        h.add_node("temp", "http://h:1", persist=False)
+        self.assertEqual(len(h.nodes()), 1)
+        h.close()
+        self._hubs.remove(h)
+        self.assertEqual(self.hub().nodes(), [])
+
+    def test_update_by_readding(self):
+        h = self.hub()
+        h.add_node("n1", "http://old")
+        h.add_node("n1", "http://new", "t2", ["x"], 3.0)
+        h.close()
+        self._hubs.remove(h)
+        rows = self.hub().nodes()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["url"], "http://new")
+
+    def test_dead_persisted_node_does_not_break_tick(self):
+        h = self.hub()
+        h.add_node("gone", DEAD_URL)
+        h.submit(self.plan(tasks=[{"id": "a"}]))
+        report = h.tick()
+        self.assertEqual(report["nodes"]["dead"], ["gone"])
+        self.assertEqual(report["blocked"][0]["job"], "a")
+
+
+# --------------------------------------------------------------------------
+# 多个控制面：只有一个在派发
+# --------------------------------------------------------------------------
+class TestLeadership(HubBase):
+    def test_second_hub_stands_by(self):
+        node, srv = self.node()
+        first = self.attach(self.hub(), node, srv)
+        second = self.hub()
+        self.attach(second, node, srv)
+
+        self.assertIsNone(first.tick()["standby"])
+        report = second.tick()
+        self.assertIsNotNone(report["standby"])
+        self.assertFalse(second.is_leader)
+        self.assertEqual(report["dispatched"], [], "待命的控制面不该派作业")
+
+    def test_leadership_hands_over_on_close(self):
+        first = self.hub()
+        second = self.hub()
+        first.tick()
+        self.assertFalse(second.tick()["standby"] is None)
+        first.close()
+        self._hubs.remove(first)
+        self.assertIsNone(second.tick()["standby"])
+        self.assertTrue(second.is_leader)
+
+    def test_leader_renews_across_ticks(self):
+        h = self.hub(leader_ttl=0.05)
+        h.tick()
+        time.sleep(0.1)                 # 超过租约
+        h.tick()
+        self.assertTrue(h.is_leader)
+
+    def test_expired_leader_is_taken_over(self):
+        first = self.hub(leader_ttl=0.05)
+        second = self.hub(leader_ttl=0.05)
+        first.tick()
+        time.sleep(0.1)
+        self.assertIsNone(second.tick()["standby"])
+        self.assertTrue(second.is_leader)
+        self.assertFalse(first.tick()["standby"] is None)
+
+
+# --------------------------------------------------------------------------
+# 产物回收（只收增量）
+# --------------------------------------------------------------------------
+class TestArtifacts(HubBase):
+    def setUp(self):
+        super(TestArtifacts, self).setUp()
+        self.mirror = os.path.join(self.tmp, "mirror")
+        self.body = "固定的一大段内容，重复很多次好形成可复用的块\n" * 2000
+
+    def hub_with_mirror(self):
+        kw = {"mirror": self.mirror}
+        kw.setdefault("poll", 0.01)
+        h = H.Hub(self.db, **kw)
+        self._hubs.append(h)
+        return h
+
+    def appending_node(self, node_id="n1", **kw):
+        def runner(job):
+            path = os.path.join(self.work, "sub", "doc.txt")
+            prev = ""
+            if os.path.exists(path):
+                with open(path) as f:
+                    prev = f.read()
+            else:
+                prev = self.body
+            with open(path, "w") as f:
+                f.write(prev + "第 %s 次修改\n" % job.id)
+            return {"stdout": "写好了"}
+
+        kw.setdefault("runner", runner)
+        return self.node(node_id, **kw)
+
+    def chain(self, h, count=3):
+        tasks = []
+        for i in range(1, count + 1):
+            task_dict = {"id": "t%d" % i, "write": ["sub/doc.txt"], "max_attempts": 1}
+            if i > 1:
+                task_dict["deps"] = ["t%d" % (i - 1)]
+            tasks.append(task_dict)
+        h.submit(self.plan(tasks=tasks))
+        return h.run_until_idle(timeout=30, poll=0.02)
+
+    def test_files_land_in_mirror(self):
+        node, srv = self.appending_node()
+        h = self.hub_with_mirror()
+        self.attach(h, node, srv)
+        self.chain(h, 2)
+
+        local = os.path.join(self.mirror, "n1", "work", "sub", "doc.txt")
+        self.assertTrue(os.path.isfile(local))
+        with open(local) as f:
+            self.assertIn("第 t2 次修改", f.read())
+
+    def test_second_transfer_uses_delta(self):
+        node, srv = self.appending_node()
+        h = self.hub_with_mirror()
+        self.attach(h, node, srv)
+        self.chain(h, 3)
+
+        modes = [[f["mode"] for f in (j.result or {})["artifacts"]["files"]]
+                 for j in h.jobs()]
+        self.assertEqual(modes[0], ["full"], "第一次只能整取")
+        for later in modes[1:]:
+            self.assertEqual(later, ["delta"], "后面应该走差分")
+
+    def test_delta_saves_bandwidth(self):
+        node, srv = self.appending_node()
+        h = self.hub_with_mirror()
+        self.attach(h, node, srv)
+        self.chain(h, 3)
+        last = sorted(h.jobs(), key=lambda j: j.id)[-1]
+        art = last.result["artifacts"]
+        self.assertGreater(art["ratio"], 0.5)
+        self.assertLess(art["sent"], art["size"])
+
+    def test_mirror_matches_node_content(self):
+        node, srv = self.appending_node()
+        h = self.hub_with_mirror()
+        self.attach(h, node, srv)
+        self.chain(h, 3)
+        with open(os.path.join(self.mirror, "n1", "work", "sub", "doc.txt")) as f:
+            local = f.read()
+        with open(os.path.join(self.work, "sub", "doc.txt")) as f:
+            remote = f.read()
+        self.assertEqual(local, remote)
+
+    def test_deletions_are_mirrored(self):
+        with open(os.path.join(self.work, "sub", "a.txt"), "w") as f:
+            f.write("节点上的旧版本")
+
+        def runner(job):
+            target = os.path.join(self.work, "sub", "a.txt")
+            os.remove(target)
+            return {"stdout": "删了"}
+
+        node, srv = self.node(runner=runner)
+        h = self.hub_with_mirror()
+        self.attach(h, node, srv)
+        os.makedirs(os.path.join(self.mirror, "n1", "work", "sub"))
+        local = os.path.join(self.mirror, "n1", "work", "sub", "a.txt")
+        with open(local, "w") as f:
+            f.write("旧版本")
+
+        h.submit(self.plan(tasks=[{"id": "d", "write": ["sub/a.txt"], "max_attempts": 1}]))
+        h.run_until_idle(timeout=10, poll=0.02)
+        self.assertFalse(os.path.exists(local), "删掉的也要同步删")
+
+    def test_chinese_node_name_gets_its_own_mirror_dir(self):
+        node, srv = self.appending_node("手机")
+        h = self.hub_with_mirror()
+        self.attach(h, node, srv)
+        self.chain(h, 1)
+
+        local = os.path.join(self.mirror, "手机", "work", "sub", "doc.txt")
+        self.assertTrue(os.path.isfile(local), "中文节点名不能被剥成 unnamed")
+
+    def test_safe_name_keeps_chinese(self):
+        self.assertEqual(H._safe_name("手机"), "手机")
+        self.assertEqual(H._safe_name("笔记本"), "笔记本")
+        self.assertEqual(H._safe_name("a/b"), "a_b")
+        self.assertEqual(H._safe_name(".."), "unnamed")
+        self.assertNotEqual(H._safe_name("手机"), H._safe_name("笔记本"))
+
+    def test_no_mirror_means_no_artifacts(self):
+        node, srv = self.appending_node()
+        h = self.attach(self.hub(), node, srv)
+        self.chain(h, 1)
+        self.assertNotIn("artifacts", h.jobs()[0].result)
+
+    def test_path_traversal_from_a_node_is_refused(self):
+        """节点是不可信方：它报上来的 changed 不能往镜像之外写。"""
+        node, srv = self.appending_node()
+        h = self.hub_with_mirror()
+        self.attach(h, node, srv)
+        self.chain(h, 1)
+        cap = h.registry.get("n1")
+        job = h.jobs()[0]
+
+        for evil in ("../../evil.txt", "/etc/passwd", "sub/../../../evil.txt",
+                     "a/../../evil.txt"):
+            report = h.collect(job, cap, {"changed": [evil]})
+            self.assertTrue(report["errors"], "应该拒绝 %r" % evil)
+            self.assertEqual(report["files"], [])
+
+        outside = os.path.join(self.mirror, "evil.txt")
+        self.assertFalse(os.path.exists(outside))
+
+    def test_mirror_path_stays_inside(self):
+        base = os.path.join(self.tmp, "mirror", "n1", "work")
+        self.assertEqual(H._mirror_path(base, "sub/a.txt"),
+                         os.path.join(base, "sub", "a.txt"))
+        self.assertEqual(H._mirror_path(base, "./sub//a.txt"),
+                         os.path.join(base, "sub", "a.txt"))
+        for bad in ("../x", "sub/../../x", "/abs", "a:b"):
+            with self.assertRaises(H.HubError):
+                H._mirror_path(base, bad)
+
+    def test_collect_reports_errors_without_failing_the_job(self):
+        node, srv = self.appending_node()
+        h = self.hub_with_mirror()
+        self.attach(h, node, srv)
+        self.chain(h, 1)
+
+        # 收产物的时候节点已经不在了：作业本身还是成功的
+        srv.stop()
+        self._servers.remove(srv)
+        h.submit(self.plan(tasks=[{"id": "z", "write": ["sub/doc.txt"],
+                                   "max_attempts": 1}]))
+        job = h.queue.get("z")
+        cap = h.registry.get("n1")
+        report = h.collect(job, cap, {"changed": ["sub/doc.txt"]})
+        self.assertTrue(report["errors"])
+        self.assertEqual(report["files"], [])
+
+
+# --------------------------------------------------------------------------
+# 多租户
+# --------------------------------------------------------------------------
+class TestMultiTenant(HubBase):
+    def setUp(self):
+        super(TestMultiTenant, self).setUp()
+        from mesh import auth as auth_mod
+        self.auth_mod = auth_mod
+        node, srv = self.node(runner=lambda job: {"stdout": "ok"})
+        self.hub = self.hub_factory()
+        self.attach(self.hub, node, srv)
+        self.server = self.hub.build_server(port=0)
+        self.server.start()
+
+    def hub_factory(self, **kw):
+        kw.setdefault("poll", 0.01)
+        h = H.Hub(self.db, **kw)
+        self._hubs.append(h)
+        return h
+
+    def tearDown(self):
+        self.server.stop()
+        super(TestMultiTenant, self).tearDown()
+
+    def token_for(self, project, perms, label=""):
+        token = self.auth_mod.new_token()
+        self.hub.queue.add_token(token, perms, project, label)
+        self.hub.auth = self.auth_mod.Auth.from_store(self.hub.queue)
+        return token
+
+    def submit(self, token, project="p"):
+        client = W.Client(self.server.url, token=token)
+        return client.call("submit", {"plan": {"project": project,
+                                               "tasks": [{"id": "z"}]}})
+
+    def test_project_token_can_submit_only_its_project(self):
+        token = self.token_for("blog", ["read", "submit"], "博客")
+        self.assertEqual(self.submit(token, "blog")["ids"], ["z"])
+        with self.assertRaises(W.WireError) as ctx:
+            self.submit(token, "code")
+        self.assertEqual(ctx.exception.status, 401)
+        self.assertIn("blog", str(ctx.exception))
+
+    def test_read_only_token_cannot_submit(self):
+        token = self.token_for("", ["read"], "只读")
+        with self.assertRaises(W.WireError):
+            self.submit(token)
+
+    def test_read_token_can_see_status(self):
+        token = self.token_for("", ["read"])
+        client = W.Client(self.server.url, token=token)
+        self.assertIn("jobs", client.call("status"))
+
+    def test_unknown_token_denied(self):
+        self.token_for("", ["read"])
+        with self.assertRaises(W.WireError) as ctx:
+            W.Client(self.server.url, token="guess").call("status")
+        self.assertEqual(ctx.exception.status, 401)
+
+    def test_admin_token_from_hub_token(self):
+        dict_hub = self.hub_factory(token="boss")
+        server = dict_hub.build_server(port=0)
+        server.start()
+        try:
+            self.assertIn("jobs", W.Client(server.url, token="boss").call("status"))
+        finally:
+            server.stop()
+
+    def test_get_status_uses_the_same_policy(self):
+        token = self.token_for("", ["read"])
+        status, body = http_get(self.server.url + "/status?token=" + token)
+        self.assertEqual(status, 200)
+        self.assertIn("nodes", body)
+        status, _body = http_get(self.server.url + "/?token=guess")
+        self.assertEqual(status, 401)
+
+    def test_no_tokens_configured_means_open(self):
+        open_hub = self.hub_factory()
+        server = open_hub.build_server(port=0)
+        server.start()
+        try:
+            self.assertIn("jobs", W.Client(server.url).call("status"))
+        finally:
+            server.stop()
+
+    def test_status_reports_auth_state(self):
+        self.token_for("blog", ["read"])
+        payload = self.hub.status()
+        self.assertTrue(payload["auth"]["enabled"])
+        self.assertEqual(payload["auth"]["grants"], 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -34,6 +34,7 @@ from __future__ import annotations
 import base64
 import hmac
 import json
+import ssl
 import threading
 import urllib.error
 import urllib.parse
@@ -74,10 +75,21 @@ def b64d(text):
 class Client(object):
     """调一个节点。线程安全（每次请求独立连接）。"""
 
-    def __init__(self, base_url, token="", timeout=DEFAULT_TIMEOUT):
+    def __init__(self, base_url, token="", timeout=DEFAULT_TIMEOUT,
+                 ca=None, insecure=False):
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.timeout = float(timeout)
+        self.ca = ca
+        self.insecure = bool(insecure)
+        self._context = None
+        if self.base_url.startswith("https"):
+            # 家庭内网大多是自签证书，系统信任链派不上用场：
+            # --tls-insecure 用来先把链路跑通，正经部署请给 --tls-ca。
+            self._context = ssl.create_default_context(cafile=ca or None)
+            if self.insecure:
+                self._context.check_hostname = False
+                self._context.verify_mode = ssl.CERT_NONE
 
     # -- 底层 ------------------------------------------------------------
     def call(self, method, payload=None):
@@ -89,7 +101,8 @@ class Client(object):
             req.add_header("Authorization", "Bearer " + self.token)
 
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with urllib.request.urlopen(req, timeout=self.timeout,
+                                        context=self._context) as resp:
                 raw = resp.read()
         except urllib.error.HTTPError as exc:
             detail = ""
@@ -122,7 +135,8 @@ class Client(object):
     def health(self):
         url = self.base_url + "/health"
         try:
-            with urllib.request.urlopen(url, timeout=self.timeout) as resp:
+            with urllib.request.urlopen(url, timeout=self.timeout,
+                                        context=self._context) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             return data.get("r") or {}
         except Exception as exc:
@@ -168,7 +182,7 @@ class Client(object):
         return self.call("job", {"job": job_dict, "lease": lease})
 
     def __repr__(self):
-        return "Client(%s)" % self.base_url
+        return "Client(%s%s)" % (self.base_url, ", tls" if self._context else "")
 
 
 # --------------------------------------------------------------------------
@@ -219,6 +233,25 @@ class _Handler(BaseHTTPRequestHandler):
                 return True
         return False
 
+    def _presented_token(self, query=""):
+        header = self.headers.get("Authorization") or ""
+        if header.startswith("Bearer "):
+            return header[7:].strip()
+        if query:
+            return dict(urllib.parse.parse_qsl(query)).get("token") or ""
+        return ""
+
+    def _hook_denied(self, hook, token, name, payload):
+        """把判定交给上层（多租户就是在这里接进来的）。返回 True 表示拦下。"""
+        try:
+            allowed, why = hook(token, name, payload)
+        except Exception as exc:                 # 判定自己炸了 —— 一律当拒绝
+            allowed, why = False, "权限判定失败：%s" % exc
+        if allowed:
+            return False
+        self._send(401, {"ok": False, "e": why or "无权访问", "t": "Unauthorized"})
+        return True
+
     # -- 路由 ------------------------------------------------------------
     def do_GET(self):
         path, _, query = self.path.partition("?")
@@ -232,8 +265,13 @@ class _Handler(BaseHTTPRequestHandler):
         if handler is None:
             self._send(404, {"ok": False, "e": "未知路径", "t": "NotFound"})
             return
-        if not self._auth_ok(query):
-            self._send(401, {"ok": False, "e": "令牌无效", "t": "Unauthorized"})
+        hook = getattr(self.server, "auth_hook", None)
+        if hook is None:
+            if not self._auth_ok(query):
+                self._send(401, {"ok": False, "e": "令牌无效", "t": "Unauthorized"})
+                return
+        elif self._hook_denied(hook, self._presented_token(query), path,
+                               dict(urllib.parse.parse_qsl(query))):
             return
         try:
             result = handler(dict(urllib.parse.parse_qsl(query)))
@@ -247,10 +285,6 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(200, {"ok": True, "r": result})
 
     def do_POST(self):
-        if not self._auth_ok():
-            self._send(401, {"ok": False, "e": "令牌无效", "t": "Unauthorized"})
-            return
-
         path = self.path.split("?")[0]
         if not path.startswith("/rpc/"):
             self._send(404, {"ok": False, "e": "未知路径", "t": "NotFound"})
@@ -274,6 +308,16 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(200, {"ok": False, "e": "请求必须是对象", "t": "BadJSON"})
             return
 
+        # 判定放在读 body 之后：多租户要知道 payload 里是哪个项目
+        hook = getattr(self.server, "auth_hook", None)
+        if hook is None:
+            if not self._auth_ok():
+                self._send(401, {"ok": False, "e": "令牌无效", "t": "Unauthorized"})
+                return
+        elif self._hook_denied(hook, self._presented_token(self.path.partition("?")[2]),
+                               method, payload):
+            return
+
         routes = getattr(self.server, "routes", {})
         handler = routes.get(method)
         if handler is None:
@@ -293,11 +337,17 @@ class Server(object):
     """把 ``{方法名: 处理函数}`` 表（POST ``/rpc/<方法>``）和
     ``{路径: 处理函数}`` 表（GET，给人看的页面/JSON）暴露成 HTTP 服务。"""
 
-    def __init__(self, host="127.0.0.1", port=0, token="", node_id=""):
+    def __init__(self, host="127.0.0.1", port=0, token="", node_id="",
+                 auth_hook=None, tls=None):
         self.host = host
         self.port = port
         self.token = token
         self.node_id = node_id
+        # auth_hook(token, 方法或路径, payload) -> (放行?, 原因)
+        # 给了 hook 就由它全权判定（多租户）；没给就退回单口令模式。
+        self.auth_hook = auth_hook
+        # tls = (certfile, keyfile)
+        self.tls = tls
         self.routes = {}
         self.get_routes = {}
         self._httpd = None
@@ -328,9 +378,17 @@ class Server(object):
         self._httpd.routes = self.routes
         self._httpd.get_routes = self.get_routes
         self._httpd.token = self.token
+        self._httpd.auth_hook = self.auth_hook
         self._httpd.node_id = self.node_id
         self._httpd.log_hook = None
         self.port = self._httpd.server_address[1]
+        if self.tls:
+            certfile, keyfile = self.tls
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            if hasattr(ssl, "TLSVersion"):       # 3.7+ 才有关掉旧协议的口子
+                context.minimum_version = ssl.TLSVersion.TLSv1_2
+            context.load_cert_chain(certfile, keyfile)
+            self._httpd.socket = context.wrap_socket(self._httpd.socket, server_side=True)
         self._thread = threading.Thread(target=self._httpd.serve_forever, name="mesh-http")
         self._thread.daemon = True
         self._thread.start()
@@ -351,7 +409,7 @@ class Server(object):
     @property
     def url(self):
         host = self.host if self.host not in ("0.0.0.0", "") else "127.0.0.1"
-        return "http://%s:%d" % (host, self.port)
+        return "%s://%s:%d" % ("https" if self.tls else "http", host, self.port)
 
     def __enter__(self):
         return self.start()
@@ -361,5 +419,6 @@ class Server(object):
         return False
 
     def __repr__(self):
-        return "Server(%s, %d routes, %d get)" % (
-            self.url, len(self.routes), len(self.get_routes))
+        return "Server(%s, %d routes, %d get%s)" % (
+            self.url, len(self.routes), len(self.get_routes),
+            ", tls" if self.tls else "")

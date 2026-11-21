@@ -149,5 +149,24 @@ class TestValueSemantics(unittest.TestCase):
         self.assertIn("mesh://n1", repr(A.parse("mesh://n1/p")))
 
 
+class TestNames(unittest.TestCase):
+    def test_chinese_node_name(self):
+        a = A.parse("mesh://手机/work/sub/a.txt")
+        self.assertEqual((a.node, a.root, a.path), ("手机", "work", "sub/a.txt"))
+        self.assertEqual(A.parse(str(a)), a, "中文名必须能往返")
+
+    def test_chinese_env_and_root(self):
+        a = A.parse("mesh://笔记本/乌班图:项目/src/a.py")
+        self.assertEqual((a.node, a.env, a.root), ("笔记本", "乌班图", "项目"))
+
+    def test_valid_names(self):
+        for name in ("n1", "手机", "my-laptop", "a_b.c", "节点1"):
+            self.assertTrue(A.is_valid_name(name), name)
+
+    def test_invalid_names(self):
+        for name in ("", "a/b", "x:y", "..", "-x", ".x", "我的 手机", "a" * 65):
+            self.assertFalse(A.is_valid_name(name), name)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

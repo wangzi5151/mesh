@@ -145,6 +145,24 @@ class TestSummaryLine(unittest.TestCase):
         self.assertIn("完成 1", again, "作业事件每轮都是新的，不受节点去重影响")
 
 
+class TestStandbyLoop(unittest.TestCase):
+    """第二个控制面必须让人看见它在待命，而不是默默不干活。"""
+
+    def test_second_hub_reports_standby(self):
+        tmp = tempfile.mkdtemp(prefix="mesh-standby-")
+        first = H.Hub(os.path.join(tmp, "q.db"))
+        second = H.Hub(first.queue.path)
+        try:
+            self.assertIsNone(first.tick()["standby"])
+            report = second.tick()
+            self.assertIsNotNone(report["standby"])
+            self.assertEqual(report["standby"], first.holder)
+        finally:
+            first.close()
+            second.close()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 # --------------------------------------------------------------------------
 # 读文件
 # --------------------------------------------------------------------------
@@ -358,6 +376,132 @@ class TestCommands(Base):
 
 
 # --------------------------------------------------------------------------
+# 节点清单 / 令牌（直接改库）
+# --------------------------------------------------------------------------
+class TestNodesCommand(Base):
+    def test_add_ls_rm(self):
+        code, out, _err = run(["nodes", "add", "n1", "http://h:1", "--db", self.db,
+                               "--token", "t", "--tags", "gpu,fast", "--weight", "2"])
+        self.assertEqual(code, 0)
+        self.assertIn("已接入", out)
+
+        code, out, _err = run(["nodes", "ls", "--db", self.db])
+        self.assertEqual(code, 0)
+        self.assertIn("n1", out)
+        self.assertIn("gpu,fast", out)
+
+        code, out, _err = run(["nodes", "rm", "n1", "--db", self.db])
+        self.assertEqual(code, 0)
+        self.assertIn("已移除", out)
+        code, out, _err = run(["nodes", "ls", "--db", self.db])
+        self.assertIn("还没有节点", out)
+
+    def test_ls_json(self):
+        run(["nodes", "add", "n1", "http://h:1", "--db", self.db])
+        code, out, _err = run(["nodes", "ls", "--db", self.db, "--json"])
+        payload = json.loads(out)
+        self.assertEqual(payload[0]["node_id"], "n1")
+
+    def test_add_needs_url(self):
+        code, _out, err = run(["nodes", "add", "n1", "--db", self.db])
+        self.assertEqual(code, 2)
+        self.assertIn("需要地址", err)
+
+    def test_rm_unknown(self):
+        Q.Queue(self.db).close()
+        code, _out, err = run(["nodes", "rm", "nope", "--db", self.db])
+        self.assertEqual(code, 2)
+        self.assertIn("没有节点", err)
+
+    def test_survives_for_the_hub(self):
+        """CLI 加进去的节点，控制面起来时自动读到。"""
+        run(["nodes", "add", "n1", "http://h:1", "--db", self.db])
+        hub = H.Hub(self.db)
+        try:
+            self.assertEqual([n["node_id"] for n in hub.nodes()], ["n1"])
+        finally:
+            hub.close()
+
+
+class TestTokenCommand(Base):
+    def test_add_prints_token_once_and_lists_it(self):
+        code, out, _err = run(["token", "add", "--db", self.db, "--perms",
+                               "read,submit", "--project", "blog", "--label", "博客"])
+        self.assertEqual(code, 0)
+        self.assertIn("只显示这一次", out)
+        lines = [l.strip() for l in out.splitlines() if l.strip()]
+        token = [l for l in lines if len(l) > 30 and " " not in l][0]
+        self.assertGreater(len(token), 20)
+
+        code, out, _err = run(["token", "ls", "--db", self.db])
+        self.assertEqual(code, 0)
+        self.assertIn("博客", out)
+        self.assertIn("blog", out)
+        self.assertNotIn(token, out, "库里只存哈希，列表不该显示明文")
+
+    def test_add_rejects_unknown_perm(self):
+        code, _out, err = run(["token", "add", "--db", self.db, "--perms", "sudo"])
+        self.assertEqual(code, 2)
+        self.assertIn("未知权限", err)
+
+    def test_default_perm_is_read(self):
+        run(["token", "add", "--db", self.db, "--label", "x"])
+        code, out, _err = run(["token", "ls", "--db", self.db, "--json"])
+        self.assertEqual(json.loads(out)[0]["perms"], ["read"])
+
+    def test_rm_by_label(self):
+        run(["token", "add", "--db", self.db, "--label", "旧"])
+        code, out, _err = run(["token", "rm", "--db", self.db, "--label", "旧"])
+        self.assertEqual(code, 0)
+        code, out, _err = run(["token", "ls", "--db", self.db])
+        self.assertIn("还没有令牌", out)
+
+    def test_rm_unknown(self):
+        Q.Queue(self.db).close()
+        code, _out, err = run(["token", "rm", "--db", self.db, "--label", "没有"])
+        self.assertEqual(code, 2)
+        self.assertIn("没找到", err)
+
+    def test_token_actually_works_on_the_hub(self):
+        run(["token", "add", "--db", self.db, "--perms", "submit", "--project", "blog"])
+        queue = Q.Queue(self.db)
+        grant = queue.load_tokens()[0]
+        queue.close()
+
+        hub = H.Hub(self.db)
+        hub.auth = __import__("mesh.auth", fromlist=["Auth"]).Auth.from_store(hub.queue)
+        try:
+            self.assertEqual(len(hub.auth.grants), 1)
+            self.assertEqual(grant["project"], "blog")
+            self.assertTrue(hub.auth.enabled)
+        finally:
+            hub.close()
+
+
+class TestNewFlags(Base):
+    def test_tls_cert_without_key(self):
+        code, _out, err = run(["node", "--id", "n1", "--root", "w=" + self.work,
+                               "--tls-cert", "/tmp/x.pem"])
+        self.assertEqual(code, 2)
+        self.assertIn("成对", err)
+
+    def test_node_accepts_rollback_flags(self):
+        args = cli.build_parser().parse_args(
+            ["node", "--id", "n1", "--root", "w=/tmp", "--no-rollback",
+             "--backup-max-mb", "8"])
+        node = cli.build_node(args)
+        self.assertFalse(node.rollback)
+        self.assertEqual(node.backup_max_bytes, 8 << 20)
+
+    def test_hub_accepts_mirror_and_tls(self):
+        args = cli.build_parser().parse_args(
+            ["hub", "--db", self.db, "--mirror", "/tmp/镜像",
+             "--tls-ca", "/tmp/ca.pem", "--tls-insecure"])
+        self.assertEqual(args.mirror, "/tmp/镜像")
+        self.assertTrue(args.tls_insecure)
+
+
+# --------------------------------------------------------------------------
 # 对着真控制面看状态
 # --------------------------------------------------------------------------
 class TestStatusFromHub(Base):
@@ -380,6 +524,12 @@ class TestStatusFromHub(Base):
         self.assertIn("n1", out)
         self.assertIn("离线", out)
         self.assertIn("queued 1", out)
+
+    def test_status_shows_scheduler_state(self):
+        code, out, _err = run(["status", "--hub", self.server.url, "--hub-token", "tok"])
+        self.assertEqual(code, 0)
+        self.assertIn("调度权", out)
+        self.assertIn("鉴权", out)
 
     def test_status_from_hub_wrong_token(self):
         code, _out, err = run(["status", "--hub", self.server.url, "--hub-token", "bad"])

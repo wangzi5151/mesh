@@ -414,5 +414,173 @@ class TestHttpEndToEnd(Base):
         self.assertEqual(self.client.read("mesh://n1/work/sub/base.txt"), old + b"tail")
 
 
+# --------------------------------------------------------------------------
+# 变更检测：删除也算改动
+# --------------------------------------------------------------------------
+class TestDeletions(Base):
+    """删除也是改动 —— 否则越界删除就是完全隐形的一手。"""
+
+    def job(self):
+        return Q.Job("j1", "p", write=["sub/*.txt"], req={"root": "work"}, max_attempts=1)
+
+    def runner_removing(self, rel):
+        path = os.path.join(self.work, *rel.split("/"))
+
+        def runner(job):
+            os.remove(path)
+            return {"stdout": "删了 %s" % rel}
+
+        return runner
+
+    def test_in_scope_deletion_is_allowed(self):
+        node = self.node(runner=self.runner_removing("sub/a.txt"))
+        out = node.op_job({"job": self.job().to_dict()})
+        self.assertEqual(out["deleted"], ["sub/a.txt"])
+        self.assertEqual(out["violations"], [])
+        self.assertTrue(out["ok"])
+
+    def test_out_of_scope_deletion_is_a_violation(self):
+        node = self.node(runner=self.runner_removing("other/b.txt"))
+        out = node.op_job({"job": self.job().to_dict()})
+        self.assertIn("other/b.txt", out["violations"])
+        self.assertFalse(out["ok"])
+        self.assertTrue(os.path.exists(os.path.join(self.work, "other", "b.txt")),
+                        "越界删除必须被回滚")
+
+
+# --------------------------------------------------------------------------
+# 回滚
+# --------------------------------------------------------------------------
+class TestRollback(Base):
+    def job(self, write=None):
+        return Q.Job("j1", "p", write=write or ["sub/*.txt"], req={"root": "work"},
+                     max_attempts=1)
+
+    def edit(self, rel, data):
+        self.write_file(rel, data)
+        return {"stdout": "改了一个不该改的文件"}
+
+    def delete(self, rel):
+        os.remove(os.path.join(self.work, rel))
+        return {"stdout": "删了一个不该删的文件"}
+
+    def run_runner(self, node, runner):
+        node.runner = runner
+        return node.op_job({"job": self.job().to_dict()})
+
+    @property
+    def other_file(self):
+        return os.path.join(self.work, "other", "b.txt")
+
+    def test_out_of_scope_edit_is_restored(self):
+        node = self.node()
+        out = self.run_runner(node, lambda job: self.edit("other/b.txt", "改坏了".encode("utf-8")))
+        self.assertFalse(out["ok"])
+        self.assertIn("other/b.txt", out["violations"])
+        self.assertTrue(out["rollback"]["clean"])
+        with open(self.other_file, "rb") as f:
+            self.assertEqual(f.read(), b"other content")
+
+    def test_new_out_of_scope_file_is_removed(self):
+        node = self.node()
+        out = self.run_runner(node, lambda job: self.edit("other/new.txt", "不该存在".encode("utf-8")))
+        self.assertFalse(out["ok"])
+        self.assertFalse(os.path.exists(os.path.join(self.work, "other", "new.txt")))
+        self.assertEqual(out["rollback"]["removed"], ["other/new.txt"])
+        self.assertTrue(out["rollback"]["clean"])
+
+    def test_deleted_file_is_put_back(self):
+        node = self.node()
+        out = self.run_runner(node, lambda job: self.delete("other/b.txt"))
+        self.assertFalse(out["ok"])
+        self.assertTrue(os.path.exists(self.other_file))
+        with open(self.other_file, "rb") as f:
+            self.assertEqual(f.read(), b"other content")
+        self.assertIn("other/b.txt", out["rollback"]["restored"])
+
+    def test_new_directory_is_pruned(self):
+        node = self.node()
+        out = self.run_runner(node, lambda job: self.edit("other/deep/deeper/x.txt", b"x"))
+        self.assertTrue(out["rollback"]["clean"])
+        self.assertFalse(os.path.exists(os.path.join(self.work, "other", "deep")))
+
+    def test_in_scope_changes_are_kept(self):
+        node = self.node()
+        out = self.run_runner(node, lambda job: self.edit("sub/ok.txt", b"fine"))
+        self.assertTrue(out["ok"])
+        self.assertNotIn("rollback", out, "没越界就不该动回滚")
+        self.assertTrue(os.path.exists(os.path.join(self.work, "sub", "ok.txt")))
+
+    def test_rollback_can_be_turned_off(self):
+        node = self.node(rollback=False)
+        out = self.run_runner(node, lambda job: self.edit("other/b.txt", "改坏了".encode("utf-8")))
+        self.assertFalse(out["ok"])
+        self.assertIn("回滚", out["rollback"]["skipped"])
+        with open(self.other_file, "rb") as f:
+            self.assertEqual(f.read(), "改坏了".encode("utf-8"))
+
+    def test_too_many_files_falls_back_to_detect_only(self):
+        node = self.node(backup_max_files=1)
+        out = self.run_runner(node, lambda job: self.edit("other/b.txt", "改坏了".encode("utf-8")))
+        self.assertFalse(out["ok"])
+        self.assertIn("文件太多", out["rollback"]["skipped"])
+
+    def test_too_big_falls_back_to_detect_only(self):
+        node = self.node(backup_max_bytes=1)
+        out = self.run_runner(node, lambda job: self.edit("other/b.txt", b"x"))
+        self.assertIn("体积太大", out["rollback"]["skipped"])
+
+    def test_backup_dir_is_cleaned_up(self):
+        import tempfile as _tempfile
+
+        node = self.node()
+        before = set(os.listdir(_tempfile.gettempdir()))
+        self.run_runner(node, lambda job: self.edit("other/b.txt", b"x"))
+        created = [n for n in set(os.listdir(_tempfile.gettempdir())) - before
+                   if n.startswith("mesh-backup-")]
+        self.assertEqual(created, [], "备份目录用完必须删掉")
+
+    def test_error_message_says_rolled_back(self):
+        node = self.node()
+        out = self.run_runner(node, lambda job: self.edit("other/b.txt", b"x"))
+        self.assertIn("已回滚", out["error"])
+
+
+class TestRunnerContract(Base):
+    def test_runner_must_return_dict(self):
+        node = self.node(runner=lambda job: "我不是字典")
+        job = Q.Job("j1", "p", req={"root": "work"})
+        with self.assertRaises(A.AgentError) as ctx:
+            node.op_job({"job": job.to_dict()})
+        self.assertIn("必须返回字典", str(ctx.exception))
+
+    def test_runner_returning_none_is_fine(self):
+        node = self.node(runner=lambda job: None)
+        job = Q.Job("j1", "p", req={"root": "work"})
+        out = node.op_job({"job": job.to_dict()})
+        self.assertTrue(out["ok"])
+
+
+class TestNodeName(Base):
+    def test_invalid_name_rejected_at_startup(self):
+        with self.assertRaises(A.AgentError) as ctx:
+            A.Node("手机/备用", roots=[{"name": "w", "path": self.work}])
+        self.assertIn("节点名不合法", str(ctx.exception))
+
+    def test_chinese_name_works_end_to_end(self):
+        node = A.Node("笔记本", roots=[{"name": "w", "path": self.work}],
+                      runner=lambda job: {"stdout": "ok"})
+        srv = node.build_server(port=0)
+        srv.start()
+        try:
+            client = W.Client(srv.url)
+            self.assertEqual(client.call("cap")["node_id"], "笔记本")
+            client.write("mesh://笔记本/w/sub/中文.txt", "内容".encode("utf-8"))
+            self.assertEqual(client.read("mesh://笔记本/w/sub/中文.txt"),
+                             "内容".encode("utf-8"))
+        finally:
+            srv.stop()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

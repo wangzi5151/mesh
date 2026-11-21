@@ -1,16 +1,16 @@
 {
-  "_说明": "控制面要连的机器清单。mesh hub --db mesh.db --nodes-file examples/nodes.json",
+  "_说明": "一次性导入用的节点清单：mesh hub --db mesh.db --nodes-file examples/nodes.json —— 导入后会写进库里，之后用 mesh nodes ls/add/rm 维护，不用再带这个文件。",
   "nodes": [
     {
       "id": "手机",
-      "url": "http://192.168.1.20:8765",
+      "url": "https://192.168.1.20:8765",
       "token": "换成你自己的",
       "tags": ["local", "llm"],
       "weight": 1.0
     },
     {
       "id": "笔记本",
-      "url": "http://192.168.1.31:8765",
+      "url": "https://192.168.1.31:8765",
       "token": "换成你自己的",
       "tags": ["gpu", "fast"],
       "weight": 2.0
